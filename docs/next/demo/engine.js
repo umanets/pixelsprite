@@ -268,18 +268,14 @@ export class SpriteModel {
     return out;
   }
 
-  /** One call of decoder_static.onnx: token x (B*d) at position pos. `into` (CPU only): a cache set the graph writes
-   * its new cache into, so no new arrays are made per step. */
-  async stepFixed(x, B, pos, cache, into) {
+  /** One call of decoder_static.onnx: token x (B*d) at position pos. (No preallocated outputs: for CPU tensors
+   * onnxruntime-web 1.31 hands back the same objects but leaves their data untouched, so the cache stayed zero and
+   * the model saw only the current pixel: horizontal stripes on phones.) */
+  async stepFixed(x, B, pos, cache) {
     const feeds = { x: new this.ort.Tensor("float32", x, [B, 1, this.d]),
                     pos: new this.ort.Tensor("int64", BigInt64Array.of(BigInt(pos)), [1]) };
     for (let i = 0; i < this.L; i++) { feeds[`past_k_${i}`] = cache[2 * i]; feeds[`past_v_${i}`] = cache[2 * i + 1]; }
-    let out;
-    if (into) {
-      const fetches = { logits: null };
-      for (let i = 0; i < this.L; i++) { fetches[`present_k_${i}`] = into[2 * i]; fetches[`present_v_${i}`] = into[2 * i + 1]; }
-      out = await this.session.run(feeds, fetches);
-    } else out = await this.session.run(feeds);
+    const out = await this.session.run(feeds);
     const next = [];
     for (let i = 0; i < this.L; i++) next.push(out[`present_k_${i}`], out[`present_v_${i}`]);
     return { logits: out.logits.data, cache: next };
@@ -295,24 +291,16 @@ export class SpriteModel {
       this.writePrefix(x0, j * T0 * d, j >= b ? condU : condC, S, mask);
       this.writePixel(x0, (j * T0 + T0 - 1) * d, this.BOS, 0, 0, edge[0]);
     }
-    let logits, cache, spare = null, pos = 0, lastYield = performance.now();
+    let logits, cache, pos = 0, lastYield = performance.now();
     const advance = async (xt) => {  // one more token -> logits of the next pixel
       const prev = cache;
-      let r;
-      if (!this.fixedCache) r = await this.step(xt, B, 1, cache);
-      else if (spare) {  // CPU: write into the spare set, then swap; if onnxruntime ignored it, stop using spares
-        const into = spare;
-        r = await this.stepFixed(xt, B, pos, cache, into);
-        spare = r.cache[0] === into[0] ? prev : null;
-      }
-      else r = await this.stepFixed(xt, B, pos, cache, null);
+      const r = this.fixedCache ? await this.stepFixed(xt, B, pos, cache) : await this.step(xt, B, 1, cache);
       pos++;
       logits = r.logits; cache = r.cache;
       if (prev !== cache) SpriteModel.release(prev);
     };
     if (this.fixedCache) {  // fixed-size cache: the prefix goes in one token at a time, like the pixels
       cache = await this.cacheSet(B, 2 + S + n);
-      if (this.ep !== "webgpu") spare = await this.cacheSet(B, 2 + S + n);
       const xt = new Float32Array(B * d);
       for (let i = 0; i < T0; i++) {
         for (let j = 0; j < B; j++) xt.set(x0.subarray((j * T0 + i) * d, (j * T0 + i + 1) * d), j * d);
