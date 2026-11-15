@@ -1,12 +1,15 @@
 // The demo page: loads onnxruntime-web and the model, turns captions into vectors, paints sprites as they are drawn.
 // Preview build at /next/: own files, own model cache and own localStorage keys, so it never touches the main demo.
-import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=7";  // ?v=N: bump with every release so browsers never mix cached files of two versions
-import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=7";
+import { HF_REPO, modelFiles, loadModel, makeRng, Strategy } from "./engine.js?v=11";  // ?v=N: bump with every release so browsers never mix cached files of two versions
+import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=11";
+import * as MX from "./mix.js?v=11";
 
 const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 const TOKENIZERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.2.0/dist/tokenizers.min.mjs";
 const MODEL_REVISION = "0a29494e9fc020a26feb6f97ec2047fc207ce898";  // a commit, so cached files never go stale
 const CACHE_NAME = "pixelsprite-next";
+const STRATEGY = ["split", "plain", "mix"].includes(new URLSearchParams(location.search).get("strategy"))
+  ? new URLSearchParams(location.search).get("strategy") : "auto";  // ?strategy=split | plain | mix to compare
 
 const params = new URLSearchParams(location.search);
 const base = (v, dflt) => (v && /^(\/|\.\/|https:\/\/)/.test(v) ? v.replace(/\/$/, "") : dflt);  // dev: ?model=/path
@@ -15,7 +18,8 @@ const ENCODER_BASE = base(params.get("encoder"), `https://huggingface.co/${ENCOD
 
 const $ = (id) => document.getElementById(id);
 const radio = (name) => document.querySelector(`input[name=${name}]:checked`).value;
-const state = { ort: null, model: null, ep: null, encoder: null, presets: new Map(), running: null, pad: null, padSize: 16 };
+const state = { ort: null, model: null, ep: null, encoder: null, presets: new Map(), running: null, pad: null, padSize: 16,
+                lex: null, kindOverride: new Map(), learnedKind: new Map(), variants: null, encoderReady: false };
 
 // Phones (iOS Safari / Chrome, Android) give a tab far less memory than a desktop: draw fewer sprites at once there.
 const MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
@@ -200,11 +204,14 @@ async function switchToCPU(reason) {
 async function boot() {
   try {
     state.safe = safeLevel();
+    state.variants = loadVariants();
     const [ort, presets] = await Promise.all([import(ORT_URL), fetch("demo/presets.json").then((r) => r.json())]);
     state.ort = ort;
     ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
     for (const it of presets.items) state.presets.set(it.text, b64floats(it.vector));
     buildChips(presets.items.map((i) => i.text));
+    MX.loadLexicon("demo", fetchPlain).then((lx) => { state.lex = lx; renderWords(); })
+      .catch((e) => console.warn("no lexicon, mixing is off:", e));
     let ep = await pickEP();
     try {  // loading is not guarded: the CPU fallback needs more memory than WebGPU, not less
       state.model = await loadBackend(ep);
@@ -231,9 +238,7 @@ function b64floats(s) {
   return new Float32Array(u8.buffer);
 }
 
-async function vectorFor(text) {
-  if (!text) return null;
-  if (state.presets.has(text)) return state.presets.get(text);
+async function getEncoder() {
   if (!state.encoder) {
     state.encoder = (async () => {
       const { Tokenizer } = await import(TOKENIZERS_URL);
@@ -243,8 +248,128 @@ async function vectorFor(text) {
     state.encoder.catch(() => { state.encoder = null; });
   }
   const enc = await state.encoder;
+  state.encoderReady = true;
   status(readyText());
-  return enc.encode(text);
+  return enc;
+}
+const encodeText = async (text) => (await getEncoder()).encode(text);
+
+async function vectorFor(text) {
+  if (!text) return null;
+  if (state.presets.has(text)) return state.presets.get(text);
+  return encodeText(text);
+}
+
+// ------------------------------------------------------------------------------------------- mixing concepts
+// See mix.js. Kinds: the user's taps (overrides) win over kinds learned for unknown words, which win over the lexicon.
+const kindsFor = () => new Map([...state.learnedKind, ...state.kindOverride]);
+// An example caption draws at once without the 135 MB text encoder; mixing it would need the encoder for words
+// outside the lexicon (the Russian and Ukrainian examples), so those examples stay one caption until it is loaded.
+const presetNeedsEncoder = (text, concepts) =>
+  state.presets.has(text) && !state.encoderReady && concepts.some((c) => !state.lex.index.has(c.text));
+const fetchPlain = async (url) => {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download failed (${r.status}): ${url}`);
+  return new Uint8Array(await r.arrayBuffer());
+};
+
+/** Words of the caption under the input: opacity = probability (strongest word is solid), attributes in italics
+ * with a dotted underline, unknown words with a dashed one; a tap flips object <-> attribute. */
+function renderWords() {
+  const box = $("words");
+  box.replaceChildren();
+  const text = $("text").value.trim();
+  if (!state.lex || !text) return;
+  const { concepts, dropped } = MX.parse(text, state.lex, kindsFor());
+  if (concepts.length < 2) return;
+  const pmax = Math.max(...concepts.map((c) => c.p));
+  for (const c of concepts) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `word${c.kind === "attribute" ? " attr" : ""}${c.known || state.learnedKind.has(c.text) ? "" : " unknown"}`;
+    b.textContent = c.text;
+    b.style.opacity = (0.35 + 0.65 * c.p / pmax).toFixed(2);
+    b.title = `${c.kind} · ${Math.round(c.p * 100)}% · tap to make it ${c.kind === "object" ? "an attribute" : "an object"}`;
+    b.onclick = () => { state.kindOverride.set(c.text, c.kind === "object" ? "attribute" : "object"); renderWords(); };
+    box.appendChild(b);
+  }
+  const pl = MX.plan(concepts, [...state.variants]), note = document.createElement("span");
+  note.className = "words-note";
+  note.textContent = radio("mode") !== "new" ? "mixing works with new shapes"
+    : presetNeedsEncoder(text, concepts) ? "one caption (mixing these words needs the text encoder)"
+    : pl ? `mix · ${pl.count} variant${pl.count === 1 ? "" : "s"}` : "one caption";
+  if (dropped) note.textContent += ` · only ${MX.MIX.MAX} words used`;
+  box.appendChild(note);
+  if (radio("mode") === "new") renderVariants(concepts);
+}
+
+// Variant chips: which ways of combining two objects a batch may use (each sprite draws one of the enabled).
+const VARIANTS_KEY = "pixelsprite-next-variants";
+function loadVariants() {
+  try {
+    const v = JSON.parse(localStorage.getItem(VARIANTS_KEY));
+    if (Array.isArray(v) && v.some((k) => MX.ALL_VARIANTS.includes(k))) return new Set(v.filter((k) => MX.ALL_VARIANTS.includes(k)));
+  } catch { /* storage off */ }
+  return new Set(MX.ALL_VARIANTS);
+}
+function renderVariants(concepts) {
+  const box = document.createElement("div");
+  box.className = "variants";
+  box.setAttribute("role", "group");
+  box.setAttribute("aria-label", "Ways to combine the words: each sprite uses one of the enabled ones that fit");
+  for (const k of MX.ALL_VARIANTS) {
+    const b = document.createElement("button"), why = MX.unfit(k, concepts);
+    b.type = "button"; b.className = `vchip${why ? " unfit" : ""}`;
+    b.setAttribute("aria-pressed", state.variants.has(k) ? "true" : "false");
+    b.title = why ? `${MX.VARIANTS[k].hint} (not for this caption: ${why})` : MX.VARIANTS[k].hint;
+    b.innerHTML = MX.icon(k);
+    b.append(document.createTextNode(MX.VARIANTS[k].title));
+    b.onclick = () => {
+      if (state.variants.has(k) && state.variants.size > 1) state.variants.delete(k); else state.variants.add(k);
+      try { localStorage.setItem(VARIANTS_KEY, JSON.stringify([...state.variants])); } catch { /* storage off */ }
+      renderWords();
+    };
+    box.appendChild(b);
+  }
+  $("words").appendChild(box);
+}
+let wordsTimer = 0;
+$("text").addEventListener("input", () => { clearTimeout(wordsTimer); wordsTimer = setTimeout(renderWords, 120); });
+
+/** The caption as a mix plan with its vectors, or null to draw it as one caption. Unknown words get the kind of
+ * their nearest lexicon entry (needs the text encoder). */
+async function prepareMix(text) {
+  if (!state.lex || !text) return null;
+  let { concepts } = MX.parse(text, state.lex, kindsFor());
+  if (concepts.length < 2 || presetNeedsEncoder(text, concepts)) return null;
+  const unknown = concepts.filter((c) => !c.known);
+  if (unknown.length) {
+    const enc = await getEncoder();
+    for (const c of unknown) {
+      c.vec = await enc.encode(c.text);
+      if (!state.learnedKind.has(c.text)) state.learnedKind.set(c.text, (await MX.nearestKind(c.vec, state.lex)).kind);
+      if (!state.kindOverride.has(c.text)) c.kind = state.learnedKind.get(c.text);
+    }
+    renderWords();
+  }
+  const pl = MX.plan(concepts, [...state.variants]);
+  if (!pl) return null;
+  const vectors = await Promise.all(pl.concepts.map((c) => c.vec || MX.conceptVector(c, state.lex, encodeText)));
+  // The "one caption" variant needs the vector of the whole caption: exact when the text encoder is already loaded,
+  // otherwise the normalised mean of the word vectors (cosine 0.85-0.95 to the exact one in checks), so a mix of
+  // common words still needs no 135 MB download.
+  let caption = null, captionExact = false;
+  if (pl.kinds.includes("caption")) {
+    if (state.presets.has(text)) { caption = state.presets.get(text); captionExact = true; }
+    else if (state.encoderReady) { caption = await encodeText(text); captionExact = true; }
+    else {
+      caption = new Float32Array(vectors[0].length);
+      for (const v of vectors) for (let j = 0; j < v.length; j++) caption[j] += v[j];
+      const norm = Math.hypot(...caption) || 1;
+      for (let j = 0; j < caption.length; j++) caption[j] /= norm;
+    }
+  }
+  return { pl, vectors, caption, captionExact };
 }
 
 // ---------------------------------------------------------------------------------------------------- controls
@@ -252,7 +377,7 @@ function buildChips(texts) {
   for (const t of [...texts, ""]) {
     const b = document.createElement("button");
     b.type = "button"; b.className = "chip"; b.textContent = t || "no text";
-    b.onclick = () => { $("text").value = t; $("text").focus(); };
+    b.onclick = () => { $("text").value = t; $("text").focus(); renderWords(); };
     $("chips").appendChild(b);
   }
 }
@@ -280,7 +405,7 @@ function updateHints() {
   $("drawbox").hidden = md !== "draw";
   if (md === "draw" && state.padSize !== size) newPad(size);
 }
-document.querySelectorAll("input[name=mode], input[name=size]").forEach((r) => r.addEventListener("change", updateHints));
+document.querySelectorAll("input[name=mode], input[name=size]").forEach((r) => r.addEventListener("change", () => { updateHints(); renderWords(); }));
 // Until the user sets "How many", it follows the size: 8 at 16x16 and 4 at 24x24 / 32x32 (4 and 2 on phones).
 let nTouched = false;
 const defaultN = (size) => (size === 16 ? (MOBILE ? (state.ep === "wasm" ? 2 : 4) : 8) : (MOBILE ? (state.ep === "wasm" ? 1 : 2) : 4));
@@ -337,11 +462,17 @@ newPad(16); updateHints();
 // ----------------------------------------------------------------------------------------------------- results
 function slug(t) { return (t || "no_text").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_|_$/g, "").slice(0, 40) || "no_text"; }
 
-function makeCard(grid, w, label) {
+function makeCard(grid, w, label, variant = null) {  // variant: {icon (static SVG), text, title} of a mix
   const card = document.createElement("div"); card.className = "card";
   const cv = document.createElement("canvas"); cv.className = "sprite"; cv.width = w; cv.height = w;
-  cv.setAttribute("role", "img"); cv.setAttribute("aria-label", label);
+  cv.setAttribute("role", "img"); cv.setAttribute("aria-label", variant ? `${label}: ${variant.title}` : label);
   card.appendChild(cv);
+  if (variant) {
+    const v = document.createElement("div"); v.className = "variant"; v.title = variant.title;
+    v.innerHTML = variant.icon;                       // our own SVG
+    v.append(document.createTextNode(variant.text));  // the caption's words: text, never HTML
+    card.appendChild(v);
+  }
   const acts = document.createElement("div"); acts.className = "acts"; card.appendChild(acts);
   grid.appendChild(card);
   const ctx = cv.getContext("2d");
@@ -414,6 +545,16 @@ function chunkFor(size) {
   return state.ep === "webgpu" ? (big ? 4 : 8) : (big ? 2 : 8);
 }
 
+// Network rows per step. On a desktop GPU a step costs about the same for 16 or 24 rows (overhead-bound), so at
+// 16x16 the budget is 24: 8 sprites of a two-caption mix (3 rows each) fit in one pass instead of two
+// (fixed cache, in + out: ~650 MB of GPU memory). Elsewhere 2 rows per sprite of chunkFor. ?rows=N overrides.
+function rowsFor(size) {
+  const forced = Number(params.get("rows"));
+  if (forced > 0) return Math.round(forced);
+  if (state.ep === "webgpu" && !MOBILE && state.safe < 1 && size === 16) return 24;
+  return 2 * chunkFor(size);
+}
+
 async function run(st) {
   $("empty")?.remove();
   const el = document.createElement("article"); el.className = "panel run";
@@ -436,10 +577,30 @@ async function run(st) {
   const t0 = performance.now();
   let frame = 0;  // pending progress repaint; cancelled on error so it cannot overwrite the error message
   try {
-    const vector = await vectorFor(st.text);
-    const model = state.model, w = st.size, chunk = chunkFor(st.size);
+    // Which inference strategy (engine.js, Strategy): "auto" mixes captions with two or more objects (or attributes)
+    // and uses split guidance otherwise; ?strategy=split | plain | mix forces one, to compare them.
+    const want = STRATEGY;
+    const mixed = st.mode === "new" && (want === "auto" || want === "mix") ? await prepareMix(st.text) : null;
+    const vector = mixed ? null : await vectorFor(st.text);
+    const model = state.model, w = st.size;
+    // One budget of network rows per step for every strategy: split guidance takes 2 rows per sprite, a mix of k
+    // captions k + 1, so a mix draws fewer sprites at once with the same memory.
     const common = { vector, size: st.size, gShape: st.gShape, gColour: st.gColour, temperature: st.temperature, topP: st.topP,
-                     chunk, signal: ctrl.signal };
+                     rows: rowsFor(st.size), signal: ctrl.signal };
+    let variants = null;
+    if (mixed) {
+      const rngV = makeRng((st.seed ^ 0x5bd1e995) >>> 0), order = mixed.pl.concepts;
+      variants = Array.from({ length: st.n }, () => MX.drawVariant(mixed.pl, rngV));
+      const asCaption = mixed.caption ? Strategy.split(model, mixed.caption, st.gShape, st.gColour) : null;
+      common.strategyFor = (id, view) => {
+        if (variants[id].kind === "caption") return asCaption;  // the plain way, side by side with the mixes
+        const { concepts, maps } = MX.variantMaps(variants[id], mixed.pl, view.S, view.o, view.w);
+        return Strategy.mix(model, mixed.vectors, order.map((c) => maps[concepts.indexOf(c)] || new Float32Array(view.S * view.S)));
+      };
+    } else if (want === "plain") {
+      const plain = Strategy.plain(model, vector);
+      common.strategyFor = () => plain;
+    }
     let mask = null, source = null, seed = st.seed;
     if (st.mode === "draw") {
       if (state.padSize !== st.size) newPad(st.size);
@@ -474,7 +635,10 @@ async function run(st) {
       mask = Uint8Array.from(source.img, (v) => (v >= 0 ? 1 : 0));
       seed += 1;
     }
-    const cards = Array.from({ length: st.n }, (_, k) => makeCard(grid, w, `sprite ${k + 1}`));
+    const cards = Array.from({ length: st.n }, (_, k) => makeCard(grid, w, `sprite ${k + 1}`, variants ? {
+      icon: MX.icon(variants[k].kind === "attributes" ? "blend" : variants[k].kind), text: MX.label(variants[k], st.text),
+      title: MX.describe(variants[k]) + (variants[k].kind === "caption" && !mixed.captionExact ? " (averaged from the word vectors)" : ""),
+    } : null));
     done = 0; total = st.n;
     const res = await model.generate({
       ...common, n: st.n, seed, mask, filter: st.filter, onPixel: live(cards),
@@ -486,7 +650,9 @@ async function run(st) {
     if (source) finishCard(source, st, "src");
     const secs = (performance.now() - t0) / 1000;
     const modeName = { new: "new shapes", same: "one shape", draw: "your shape" }[st.mode];
-    let m = `${modeName} · seed ${st.seed} · shape g ${st.gShape} · colour g ${st.gColour}`;
+    let m = mixed
+      ? `mix of ${mixed.pl.concepts.map((c) => c.text).join(", ")} · ${new Set(variants.map((v) => MX.label(v, st.text))).size} variants · seed ${st.seed}`
+      : `${modeName} · seed ${st.seed} · shape g ${st.gShape} · colour g ${st.gColour}`;
     if (st.temperature !== 1) m += ` · T ${st.temperature}`;
     if (st.topP !== 1) m += ` · top-p ${st.topP}`;
     if (!mask && st.filter && res.stats.rejected) m += ` · filter redrew ${res.stats.rejected}`;
