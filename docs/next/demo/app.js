@@ -1,11 +1,11 @@
 // The demo page: loads onnxruntime-web and the model, turns captions into vectors, paints sprites as they are drawn.
 // Preview build at /next/: own files, own model cache and own localStorage keys, so it never touches the main demo.
-import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=2";  // ?v=N: bump with every release so browsers never mix cached files of two versions
-import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=2";
+import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=3";  // ?v=N: bump with every release so browsers never mix cached files of two versions
+import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=3";
 
 const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 const TOKENIZERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.2.0/dist/tokenizers.min.mjs";
-const MODEL_REVISION = "57988643e000dba67e208260f352c845c8f6628f";  // a commit, so cached files never go stale
+const MODEL_REVISION = "0a29494e9fc020a26feb6f97ec2047fc207ce898";  // a commit, so cached files never go stale
 const CACHE_NAME = "pixelsprite-next";
 
 const params = new URLSearchParams(location.search);
@@ -97,7 +97,9 @@ const progress = (what) => (got, total) =>
 const readyText = () => {
   let s = state.ep === "webgpu" ? "Ready. Drawing on your GPU."
     : state.safe >= 2 ? "Ready. Drawing on the CPU."
-    : "Ready. No WebGPU in this browser, so drawing on the CPU: 16×16 is fine, 24×24 and 32×32 are slow.";
+    : state.why === "no WebGPU in this browser"
+      ? "Ready. No WebGPU in this browser, so drawing on the CPU: 16×16 is fine, 24×24 and 32×32 are slow."
+      : "Ready. Drawing on the CPU: 16×16 is fine, 24×24 and 32×32 are slow.";
   if (state.crashed) s += " The page closed during the last run, probably out of memory, so it now draws one sprite at a time"
     + (state.safe >= 2 ? " on the CPU." : ".");
   return s;
@@ -106,22 +108,35 @@ const readyText = () => {
 // ------------------------------------------------------------------------------------------------ model loading
 async function pickEP() {
   const forced = params.get("ep");
-  if (forced === "wasm" || forced === "webgpu") return forced;
-  if (state.safe >= 2) return "wasm";
-  try { if (navigator.gpu && (await navigator.gpu.requestAdapter())) return "webgpu"; } catch { /* no WebGPU */ }
+  if (forced === "wasm" || forced === "webgpu") { state.why = `forced by ?ep=${forced}`; return forced; }
+  if (state.safe >= 2) { state.why = "CPU after two crashes"; return "wasm"; }
+  if (!navigator.gpu) { state.why = "no WebGPU in this browser"; return "wasm"; }
+  try {
+    if (await navigator.gpu.requestAdapter()) { state.why = "WebGPU adapter found"; return "webgpu"; }
+    state.why = "WebGPU present but no adapter";
+  } catch (e) { state.why = `WebGPU adapter error: ${e.message || e}`; }
   return "wasm";
 }
 
-async function warmUp(model) {  // one prefix step + one cached step: compiles shaders and proves the backend works
-  const S = 16, T0 = 2 + S + 1, x = new Float32Array(T0 * model.d);
-  model.writePrefix(x, 0, model.condition(null), S, null);
-  model.writePixel(x, (T0 - 1) * model.d, model.BOS, 0, 0, 3);
-  const a = await model.step(x, 1, T0, model.emptyCache(1));
-  const x1 = new Float32Array(model.d);
-  model.writePixel(x1, 0, model.E, 0, 1, 3);
-  const b = await model.step(x1, 1, 1, a.cache);
+async function warmUp(model) {  // two steps with a tiny fixed cache: compiles shaders and proves the backend works
+  const x = new Float32Array(model.d);
+  model.writePixel(x, 0, model.BOS, 0, 0, 3);
+  const zero = await model.cacheSet(1, 4);
+  const a = await model.stepFixed(x, 1, 0, zero, null);
+  model.constructor.release(zero);
+  model.writePixel(x, 0, model.E, 0, 1, 3);
+  const b = await model.stepFixed(x, 1, 1, a.cache, null);
   model.constructor.release(a.cache); model.constructor.release(b.cache);
   if (!Number.isFinite(b.logits[0])) throw new Error("the backend returned NaN");
+}
+
+function diagnostics() {  // one line for screenshots: what this device got and why
+  const ua = navigator.userAgent, ios = ua.match(/OS (\d+)[._](\d+)/), saf = ua.match(/Version\/(\d+(\.\d+)?)/);
+  const parts = [state.ep === "webgpu" ? "WebGPU" : "CPU", state.why, MOBILE ? "phone" : "desktop",
+                 `batch ${chunkFor(16)} / ${chunkFor(32)}`, `safe ${state.safe}`];
+  if (/iPhone|iPad|iPod/.test(ua) && ios) parts.push(`iOS ${ios[1]}.${ios[2]}`);
+  if (saf) parts.push(`Safari ${saf[1]}`);
+  $("diag").textContent = parts.join(" · ");
 }
 
 if (params.has("debug")) {  // record WebAssembly memories, to see how much the heap grows (console: wasmMB())
@@ -145,7 +160,7 @@ async function boot() {
     let ep = await pickEP();
     const files = modelFiles(MODEL_BASE);
     const load = async (ep) => {
-      const m = await loadModel({ ort, files, ep, fetchBytes, onProgress: progress("Downloading the model (once)") });
+      const m = await loadModel({ ort, files, ep, fetchBytes, fixedCache: true, onProgress: progress("Downloading the model (once)") });
       status(ep === "webgpu" ? "Preparing the GPU…" : "Preparing…");
       await warmUp(m);
       return m;
@@ -155,12 +170,14 @@ async function boot() {
     } catch (e) {
       if (ep !== "webgpu") throw e;
       console.warn("WebGPU failed, falling back to the CPU:", e);
+      state.why = `WebGPU failed: ${e.message || e}`.slice(0, 160);
       ep = "wasm";
       state.model = await load(ep);
     }
     state.ep = ep;
     $("ep").textContent = ep === "webgpu" ? "WebGPU" : "CPU";
     $("ep").hidden = false;
+    diagnostics();
     status(readyText());
     $("go").disabled = false;
     updateHints();
@@ -357,7 +374,7 @@ function readSettings() {
 function chunkFor(size) {
   const big = size !== 16;
   if (state.safe >= 1) return 1;
-  if (MOBILE) return big ? 1 : 2;
+  if (MOBILE) return 1;
   return state.ep === "webgpu" ? (big ? 4 : 8) : (big ? 2 : 8);
 }
 
