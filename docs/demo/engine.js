@@ -8,20 +8,54 @@ export const HF_REPO = "ihor-umanets/pixelsprite-canvas-v2";
 
 export function modelFiles(base) {
   return {
-    decoder: `${base}/onnx/decoder.onnx`,
+    decoder: `${base}/onnx/decoder.onnx`,   // float32 graph, large weights as external data "decoder.data"
+    decoderStatic: `${base}/onnx/decoder_static.onnx`,  // the same with a fixed-size cache (same external data)
+    weights: `${base}/onnx/decoder.f16`,    // those weights as float16, in the same order
     embJson: `${base}/onnx/embeddings.json`,
     embBin: `${base}/onnx/embeddings.bin`,
     palette: `${base}/palette.json`,
   };
 }
 
+export const DATA_NAME = "decoder.data";
+
 const json = (bytes) => JSON.parse(new TextDecoder().decode(bytes));
 
-export async function loadModel({ ort, files, ep = "wasm", fetchBytes, onProgress }) {
+// On the CPU, onnxruntime-web computes inside session.run on this thread and resolves at once, so a loop of awaits
+// never gives the browser a chance to paint (the page looks frozen; phones may give up on it). A MessageChannel
+// task (no 4 ms clamp like setTimeout) lets it render between steps.
+const yieldToBrowser = () => new Promise((resolve) => {
+  const ch = new MessageChannel();
+  ch.port1.onmessage = () => { ch.port1.close(); resolve(); };
+  ch.port2.postMessage(0);
+});
+
+let HALF = null;
+/** Little-endian float16 bytes -> float32 bytes (the weights are shipped as float16 to halve the download). */
+export function halfToFloat(bytes) {
+  if (!HALF) {
+    HALF = new Float32Array(65536);
+    for (let h = 0; h < 65536; h++) {
+      const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 31, f = h & 1023;
+      HALF[h] = e === 0 ? s * f * 2 ** -24 : e === 31 ? (f ? NaN : s * Infinity) : s * (1 + f / 1024) * 2 ** (e - 15);
+    }
+  }
+  if (bytes.byteOffset % 2) bytes = bytes.slice();
+  const h = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1), out = new Float32Array(h.length);
+  for (let i = 0; i < h.length; i++) out[i] = HALF[h[i]];
+  return new Uint8Array(out.buffer);
+}
+
+/** Loads the decoder. The weights go in as external data: onnxruntime-web then uploads them straight to the GPU
+ * (WebGPU) instead of first copying the whole model into the WebAssembly heap, which never shrinks again; that
+ * copy alone took ~560 MB and crashed phones. files.weights may be omitted for a self-contained graph (tests).
+ * fixedCache: use decoder_static.onnx, whose cache keeps one size for the whole run (memory stays flat). */
+export async function loadModel({ ort, files, ep = "wasm", fetchBytes, onProgress, sessionOptions = {}, fixedCache = false }) {
   const [info, pal, emb] = await Promise.all([
     fetchBytes(files.embJson).then(json), fetchBytes(files.palette).then(json), fetchBytes(files.embBin)]);
-  const decoder = await fetchBytes(files.decoder, onProgress);
-  const opts = { executionProviders: [ep], graphOptimizationLevel: "all" };
+  const decoder = await fetchBytes(fixedCache ? files.decoderStatic : files.decoder, files.weights ? null : onProgress);
+  const opts = { executionProviders: [ep], graphOptimizationLevel: "all", ...sessionOptions };
+  if (files.weights) opts.externalData = [{ path: DATA_NAME, data: halfToFloat(await fetchBytes(files.weights, onProgress)) }];
   if (ep === "webgpu") {  // keep the cache on the GPU between steps; only the logits come back
     opts.preferredOutputLocation = {};
     for (let i = 0; i < info.n_layers; i++) {
@@ -30,7 +64,9 @@ export async function loadModel({ ort, files, ep = "wasm", fetchBytes, onProgres
     }
   }
   const session = await ort.InferenceSession.create(decoder, opts);
-  return new SpriteModel(ort, session, info, emb, pal.colors, ep);
+  const model = new SpriteModel(ort, session, info, emb, pal.colors, ep);
+  model.fixedCache = fixedCache;
+  return model;
 }
 
 // ------------------------------------------------------------------------------------------------- random numbers
@@ -215,6 +251,36 @@ export class SpriteModel {
 
   static release(cache) { for (const t of cache) if (t.location === "gpu-buffer") t.dispose(); }
 
+  /** A zero-filled fixed-size cache: 2 * layers tensors (B, H, M, hd). On WebGPU they are created on the GPU
+   * (new buffers start as zeros): a CPU tensor would first be copied into the WebAssembly heap, which never shrinks
+   * (256 MB after one 16x16 run of 8 sprites, 531 MB after 32x32). */
+  async cacheSet(B, M) {
+    const dims = [B, this.H, M, this.hd], out = [];
+    if (this.ep === "webgpu") {
+      const device = await this.ort.env.webgpu.device, size = B * this.H * M * this.hd * 4;
+      for (let i = 0; i < 2 * this.L; i++) {
+        const buf = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+        out.push(this.ort.Tensor.fromGpuBuffer(buf, { dataType: "float32", dims, dispose: () => buf.destroy() }));
+      }
+      return out;
+    }
+    for (let i = 0; i < 2 * this.L; i++) out.push(new this.ort.Tensor("float32", new Float32Array(B * this.H * M * this.hd), dims));
+    return out;
+  }
+
+  /** One call of decoder_static.onnx: token x (B*d) at position pos. (No preallocated outputs: for CPU tensors
+   * onnxruntime-web 1.31 hands back the same objects but leaves their data untouched, so the cache stayed zero and
+   * the model saw only the current pixel: horizontal stripes on phones.) */
+  async stepFixed(x, B, pos, cache) {
+    const feeds = { x: new this.ort.Tensor("float32", x, [B, 1, this.d]),
+                    pos: new this.ort.Tensor("int64", BigInt64Array.of(BigInt(pos)), [1]) };
+    for (let i = 0; i < this.L; i++) { feeds[`past_k_${i}`] = cache[2 * i]; feeds[`past_v_${i}`] = cache[2 * i + 1]; }
+    const out = await this.session.run(feeds);
+    const next = [];
+    for (let i = 0; i < this.L; i++) next.push(out[`present_k_${i}`], out[`present_v_${i}`]);
+    return { logits: out.logits.data, cache: next };
+  }
+
   /** Draws b sprites on an S x S canvas in parallel. Returns b Int16Arrays (palette index, -1 = transparent). */
   async drawChunk(p, b, rng, onPixel) {
     const { condC, condU, S, mask, win, gShape, gColour, temperature, topP } = p;
@@ -225,7 +291,22 @@ export class SpriteModel {
       this.writePrefix(x0, j * T0 * d, j >= b ? condU : condC, S, mask);
       this.writePixel(x0, (j * T0 + T0 - 1) * d, this.BOS, 0, 0, edge[0]);
     }
-    let { logits, cache } = await this.step(x0, B, T0, this.emptyCache(B));
+    let logits, cache, pos = 0, lastYield = performance.now();
+    const advance = async (xt) => {  // one more token -> logits of the next pixel
+      const prev = cache;
+      const r = this.fixedCache ? await this.stepFixed(xt, B, pos, cache) : await this.step(xt, B, 1, cache);
+      pos++;
+      logits = r.logits; cache = r.cache;
+      if (prev !== cache) SpriteModel.release(prev);
+    };
+    if (this.fixedCache) {  // fixed-size cache: the prefix goes in one token at a time, like the pixels
+      cache = await this.cacheSet(B, 2 + S + n);
+      const xt = new Float32Array(B * d);
+      for (let i = 0; i < T0; i++) {
+        for (let j = 0; j < B; j++) xt.set(x0.subarray((j * T0 + i) * d, (j * T0 + i + 1) * d), j * d);
+        await advance(xt);
+      }
+    } else ({ logits, cache } = await this.step(x0, B, T0, this.emptyCache(B)));
     const out = Array.from({ length: b }, () => new Int16Array(n).fill(-1));
     const x = new Float32Array(B * d), tok = new Int32Array(b);
     const col = new Float64Array(K), order = topP < 1 ? new Int32Array(K) : null;
@@ -247,9 +328,8 @@ export class SpriteModel {
         if (t + 1 === n) break;
         const r = ((t + 1) / S) | 0, c = (t + 1) % S;
         for (let j = 0; j < B; j++) this.writePixel(x, j * d, tok[j % b], r, c, edge[t + 1]);
-        const prev = cache;
-        ({ logits, cache } = await this.step(x, B, 1, cache));
-        SpriteModel.release(prev);
+        await advance(x);
+        if (performance.now() - lastYield > 40) { await yieldToBrowser(); lastYield = performance.now(); }
       }
     } finally {
       SpriteModel.release(cache);
