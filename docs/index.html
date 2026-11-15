@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pixelsprite: pixel sprites from text, in your browser</title>
+<meta name="description" content="A 39M-parameter transformer draws 16×16, 24×24 and 32×32 pixel-art sprites from a caption, one pixel at a time. It runs entirely in your browser.">
+<meta property="og:title" content="pixelsprite: pixel sprites from text, in your browser">
+<meta property="og:description" content="A small transformer draws pixel-art sprites one pixel at a time. English, Russian or Ukrainian captions. No server.">
+<meta property="og:image" content="https://umanets.github.io/pixelsprite/sheet_32.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8' shape-rendering='crispEdges'%3E%3Cpath fill='%23181b21' d='M6 0h2v2H7v1H6v1H5v1H4V4H3V3h1V2h1V1h1z'/%3E%3Cpath fill='%237fd0f2' d='M6 1h1v1H6zM5 2h1v1H5zM4 3h1v1H4z'/%3E%3Cpath fill='%23b5651d' d='M1 5h1v1h1v1H2v1H1V7H0V6h1z'/%3E%3Cpath fill='%23181b21' d='M2 4h1v1h1v1H3V5H2z'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f3f4f6; --panel: #ffffff; --ink: #16181d; --ink-2: #4b505b; --muted: #6f7582; --rule: #dde0e6;
+  --accent: #2d5bd0; --accent-ink: #ffffff; --accent-soft: #e6ecfa; --err: #b42318; --ok: #1f7a4d;
+  --chk-a: #ffffff; --chk-b: #e7e9ed; --paint: #16181d; --grid: #dfe2e8; --cursor: rgba(45, 91, 208, 0.55);
+  --font: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101216; --panel: #181b21; --ink: #e7e9ee; --ink-2: #b2b7c1; --muted: #8b919d; --rule: #2a2e36;
+    --accent: #7f9ef2; --accent-ink: #0c1220; --accent-soft: #1b2440; --err: #ff8a80; --ok: #6fd6a2;
+    --chk-a: #2a2d33; --chk-b: #22252b; --paint: #e7e9ee; --grid: #2f333b; --cursor: rgba(127, 158, 242, 0.6);
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--font); padding: 20px 16px 32px; }
+a { color: var(--accent); }
+.wrap { max-width: 1500px; margin: 0 auto; }
+.top { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: end; justify-content: space-between; margin-bottom: 20px; }
+.top h1 { font-size: 1.6rem; margin: 0; letter-spacing: 0.01em; }
+.top p { margin: 2px 0 0; color: var(--ink-2); max-width: 62ch; }
+.links { display: flex; gap: 8px; flex-wrap: wrap; }
+.links a { font-size: 13px; text-decoration: none; border: 1px solid var(--rule); background: var(--panel); color: var(--ink-2); border-radius: 999px; padding: 4px 12px; }
+.links a:hover { border-color: var(--accent); color: var(--accent); }
+.app { display: grid; grid-template-columns: 350px minmax(0, 1fr); gap: 24px; align-items: start; }
+@media (max-width: 860px) { .app { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+@media (min-width: 861px) { .controls { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto; } }
+label, .lbl { font-size: 13px; color: var(--ink-2); font-weight: 600; display: block; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+input[type=text], input[type=number] { width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; }
+input:focus-visible, button:focus-visible, summary:focus-visible, .seg label:focus-within, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: 12px var(--font); border: 1px solid var(--rule); background: var(--bg); color: var(--ink-2); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+.seg label { margin: 0; font-weight: 500; font-size: 13px; text-align: center; padding: 7px 4px; cursor: pointer; color: var(--ink-2); border-left: 1px solid var(--rule); }
+.seg label:first-child { border-left: 0; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--accent-soft); color: var(--accent); }
+.slider { display: grid; grid-template-columns: 1fr 3.2rem; gap: 10px; align-items: center; }
+.slider output { font: 13px var(--mono); text-align: right; color: var(--ink); }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.hint { font-size: 12px; color: var(--muted); }
+.hint.warn { color: var(--err); }
+.checks { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--ink-2); }
+.checks label { font-weight: 400; display: flex; gap: 8px; align-items: center; }
+details { border-top: 1px solid var(--rule); padding-top: 12px; }
+summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+details[open] summary { margin-bottom: 12px; }
+details .field + .field { margin-top: 14px; }
+.btn { font: 600 15px var(--font); border: 0; border-radius: 6px; padding: 11px 14px; background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn.stop { background: var(--panel); color: var(--err); border: 1px solid var(--err); }
+.btn-sm { font: 12px var(--font); border: 1px solid var(--rule); border-radius: 5px; padding: 4px 9px; background: var(--panel); color: var(--ink-2); cursor: pointer; text-decoration: none; white-space: nowrap; }
+.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+.status { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--ink-2); }
+.status-line { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+.status.error { color: var(--err); }
+.bar { height: 6px; border-radius: 3px; background: var(--accent-soft); overflow: hidden; }
+.bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
+.badge { font: 11px var(--mono); padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.drawbox { display: flex; flex-direction: column; gap: 8px; }
+#pad { width: 100%; max-width: 312px; aspect-ratio: 1; touch-action: none; cursor: crosshair; border: 1px solid var(--rule); border-radius: 4px; background: var(--bg); }
+.drawtools { display: flex; gap: 6px; flex-wrap: wrap; }
+.results { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.run { display: flex; flex-direction: column; gap: 12px; }
+.run-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+.run-title { font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.meta { font: 12px/1.6 var(--mono); color: var(--muted); }
+.meta.error { color: var(--err); font-family: var(--font); font-size: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 12px; }
+.card { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+.sprite { width: 128px; height: 128px; image-rendering: pixelated; border-radius: 4px; border: 1px solid var(--rule);
+  background: repeating-conic-gradient(var(--chk-a) 0 25%, var(--chk-b) 0 50%) 0 0 / 16px 16px; }
+.card.source .sprite { border-color: var(--accent); }
+.card .acts { display: flex; gap: 4px; min-height: 24px; }
+.card .tag { font-size: 11px; color: var(--accent); }
+.empty-state { color: var(--muted); }
+.empty-state img { width: 100%; max-width: 560px; image-rendering: pixelated; border-radius: 4px; }
+footer { max-width: 1500px; margin: 28px auto 0; font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right: 8px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } .bar span { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>pixelsprite</h1>
+      <p>Type a caption and a small transformer (39M parameters) draws pixel-art sprites one pixel at a time. It runs in your browser: nothing is sent to a server.</p>
+    </div>
+    <nav class="links" aria-label="Project links">
+      <a href="https://github.com/umanets/pixelsprite">Code on GitHub</a>
+      <a href="https://huggingface.co/ihor-umanets/pixelsprite-canvas-v2">Model on Hugging Face</a>
+    </nav>
+  </header>
+
+  <div class="app">
+    <form class="panel controls" id="form" autocomplete="off">
+      <div class="status" id="status" aria-live="polite">
+        <div class="status-line"><span id="statusText">Checking your browser…</span><span class="badge" id="ep" hidden></span></div>
+        <div class="bar" id="bar" hidden><span id="barFill"></span></div>
+      </div>
+
+      <div class="field">
+        <label for="text">Caption</label>
+        <input type="text" id="text" placeholder="empty = no text" value="frost sword" maxlength="200">
+        <div class="chips" id="chips"></div>
+        <div class="hint">English, Russian or Ukrainian. Your own caption loads the text encoder once (about 135 MB).</div>
+      </div>
+
+      <div class="field">
+        <span class="lbl" id="sizeLbl">Size</span>
+        <div class="seg" role="radiogroup" aria-labelledby="sizeLbl">
+          <label><input type="radio" name="size" value="16" checked>16×16</label>
+          <label><input type="radio" name="size" value="24">24×24</label>
+          <label><input type="radio" name="size" value="32">32×32</label>
+        </div>
+        <div class="hint" id="sizeHint"></div>
+      </div>
+
+      <div class="field">
+        <span class="lbl" id="modeLbl">Silhouette</span>
+        <div class="seg" role="radiogroup" aria-labelledby="modeLbl">
+          <label><input type="radio" name="mode" value="new" checked>new</label>
+          <label><input type="radio" name="mode" value="same">one shape</label>
+          <label><input type="radio" name="mode" value="draw">draw</label>
+        </div>
+        <div class="hint" id="modeHint"></div>
+        <div class="drawbox" id="drawbox" hidden>
+          <canvas id="pad" width="312" height="312" aria-label="Grid for drawing a silhouette"></canvas>
+          <div class="drawtools">
+            <button type="button" class="btn-sm" id="clearPad">clear</button>
+            <button type="button" class="btn-sm" id="fillPad">fill all</button>
+            <button type="button" class="btn-sm" id="invertPad">invert</button>
+          </div>
+          <div class="hint">Draw with the mouse or a finger; the right button or Shift erases.</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="field"><label for="n">How many</label><input type="number" id="n" min="1" max="32" value="8"></div>
+        <div class="field">
+          <label for="seed">Seed</label>
+          <div style="display:flex;gap:6px"><input type="number" id="seed" value="0"><button type="button" class="btn-sm" id="rnd" title="random seed">rnd</button></div>
+        </div>
+      </div>
+
+      <details>
+        <summary>More settings</summary>
+        <div class="field">
+          <label for="gs">Shape guidance</label>
+          <div class="slider"><input type="range" id="gs" min="0" max="4" step="0.25" value="1"><output for="gs" id="gsv"></output></div>
+          <label for="gc">Colour guidance</label>
+          <div class="slider"><input type="range" id="gc" min="0" max="4" step="0.25" value="2"><output for="gc" id="gcv"></output></div>
+          <div class="hint">Shape 1 keeps silhouettes and poses as varied as in the data; higher makes them more typical but loses poses. Colour 2 follows the caption's colours more closely.</div>
+        </div>
+        <div class="field">
+          <label for="tc">Colour temperature</label>
+          <div class="slider"><input type="range" id="tc" min="0.3" max="1.5" step="0.05" value="1"><output for="tc" id="tcv"></output></div>
+          <label for="tp">Top-p</label>
+          <div class="slider"><input type="range" id="tp" min="0.5" max="1" step="0.01" value="1"><output for="tp" id="tpv"></output></div>
+        </div>
+        <div class="field checks">
+          <label><input type="checkbox" id="filter" checked> redraw sprites with stray 1–2 px pieces</label>
+          <label><input type="checkbox" id="autoseed" checked> new seed every run</label>
+        </div>
+      </details>
+
+      <button class="btn" id="go" type="submit" disabled>Draw</button>
+    </form>
+
+    <section class="results" id="results" aria-live="polite">
+      <div class="panel empty-state" id="empty">
+        <img src="sheet_16.png" alt="Sample 16×16 sprites drawn by the model">
+        <div>Sprites appear here as the model draws them, pixel by pixel, row by row. New runs go on top.</div>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <div>Runs on <a href="https://onnxruntime.ai/">onnxruntime-web</a>: WebGPU when your browser has it, otherwise the CPU through WebAssembly (much slower for 24×24 and 32×32). Seeds give different sprites here than in the Python package.</div>
+    <div>Model weights: CC BY-NC 4.0, trained on AI-generated sprites (see the model card). Code: Apache-2.0. © 2026 Ihor Umanets.</div>
+  </footer>
+</div>
+<script type="module" src="demo/app.js"></script>
+</body>
+</html>

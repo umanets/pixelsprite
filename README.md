@@ -2,6 +2,8 @@
 
 Type a caption and get pixel-art sprites at 16×16, 24×24 or 32×32. Captions can be in English, Russian or Ukrainian. You can also draw a silhouette and let the model colour it.
 
+**Try it in your browser: [umanets.github.io/pixelsprite](https://umanets.github.io/pixelsprite/)**. Nothing to install: the model runs on your GPU through WebGPU, or on the CPU.
+
 ![32x32 samples](docs/sheet_32.png)
 
 The model is a small autoregressive transformer (39.1M parameters). It draws a sprite one pixel at a time, left to right and top to bottom. For each pixel it picks one of 1,024 palette colours or "transparent". This is the same next-token idea used by text models, applied to pixels instead of words. The weights are on Hugging Face: [`ihor-umanets/pixelsprite-canvas-v2`](https://huggingface.co/ihor-umanets/pixelsprite-canvas-v2).
@@ -93,7 +95,8 @@ pixelsprite/      model.py (transformer), sampling.py (guidance, KV cache, filte
                   text.py (encoder), cli.py, webui/ (server.py + index.html)
 learn/            notebooks for the article (run on a laptop CPU or free Colab)
 tests/            pytest; set PIXELSPRITE_TEST_MODEL=<repo or folder> to also test the real weights
-docs/             sample sheets
+docs/             sample sheets and the browser demo (GitHub Pages): index.html, demo/engine.js (the sampler on
+                  onnxruntime-web), demo/text.js (caption encoder), demo/app.js (the page)
 ```
 
 ## Licence
