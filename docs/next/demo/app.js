@@ -1,7 +1,7 @@
 // The demo page: loads onnxruntime-web and the model, turns captions into vectors, paints sprites as they are drawn.
 // Preview build at /next/: own files, own model cache and own localStorage keys, so it never touches the main demo.
-import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=3";  // ?v=N: bump with every release so browsers never mix cached files of two versions
-import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=3";
+import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=4";  // ?v=N: bump with every release so browsers never mix cached files of two versions
+import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=4";
 
 const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 const TOKENIZERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.2.0/dist/tokenizers.min.mjs";
@@ -39,11 +39,14 @@ function safeLevel() {
     level = Math.min(2, Math.max(level, busy.level || 0) + 1);
     store.set(SAFE, level);
     state.crashed = true;
+    state.crashedAt = `${busy.ep === "webgpu" ? "WebGPU" : "CPU"}${busy.at ? `, ${busy.at}` : ""}`;
   }
   store.del(BUSY);
   return level;
 }
-const markBusy = (phase) => store.set(BUSY, { t: Date.now(), phase, level: state.safe });
+// The marker also records how far the run got (updated about once a second), so after a crash the diagnostics
+// line can say where it died: at the same pixel every time, or later with fewer sprites.
+const markBusy = (phase, at = "") => store.set(BUSY, { t: Date.now(), phase, level: state.safe, ep: state.ep, at });
 const markIdle = () => store.del(BUSY);
 addEventListener("pagehide", markIdle);
 
@@ -136,6 +139,7 @@ function diagnostics() {  // one line for screenshots: what this device got and 
                  `batch ${chunkFor(16)} / ${chunkFor(32)}`, `safe ${state.safe}`];
   if (/iPhone|iPad|iPod/.test(ua) && ios) parts.push(`iOS ${ios[1]}.${ios[2]}`);
   if (saf) parts.push(`Safari ${saf[1]}`);
+  if (state.crashedAt) parts.push(`last crash: ${state.crashedAt}`);
   $("diag").textContent = parts.join(" · ");
 }
 
@@ -409,9 +413,14 @@ async function run(st) {
       if (!state.pad.some((v) => v)) throw new Error("Draw a silhouette first.");
       mask = state.pad.slice();
     }
-    let frame = 0, pending = null, done = 0, total = 0;
+    let frame = 0, pending = null, done = 0, total = 0, noted = 0;
     const live = (cards) => (ids, t, imgs, view) => {
       pending = { ids, t, imgs, view, cards };
+      const now = performance.now();
+      if (now - noted > 1000) {
+        noted = now;
+        markBusy("run", `${st.size}×${st.size}, sprite ${done + 1} of ${total}, pixel ${t + 1} of ${view.S * view.S}, ${((now - t0) / 1000).toFixed(0)} s`);
+      }
       if (!frame) frame = requestAnimationFrame(() => {
         frame = 0;
         const p = pending;
