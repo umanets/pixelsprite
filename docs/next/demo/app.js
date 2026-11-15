@@ -1,7 +1,7 @@
 // The demo page: loads onnxruntime-web and the model, turns captions into vectors, paints sprites as they are drawn.
 // Preview build at /next/: own files, own model cache and own localStorage keys, so it never touches the main demo.
-import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=4";  // ?v=N: bump with every release so browsers never mix cached files of two versions
-import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=4";
+import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=5";  // ?v=N: bump with every release so browsers never mix cached files of two versions
+import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=5";
 
 const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 const TOKENIZERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.2.0/dist/tokenizers.min.mjs";
@@ -20,6 +20,10 @@ const state = { ort: null, model: null, ep: null, encoder: null, presets: new Ma
 // Phones (iOS Safari / Chrome, Android) give a tab far less memory than a desktop: draw fewer sprites at once there.
 const MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
   (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));  // iPadOS reports itself as a Mac
+// iPhone / iPad (every iOS browser is WebKit): WebGPU there crashed the tab or lost the device mid-run in tests
+// (onnxruntime-web 1.31, Safari 26.6), so iOS draws on the CPU unless ?ep=webgpu. ?ios simulates it on a desktop.
+const IOS = params.has("ios") || /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
 
 // If the tab dies while drawing (out of memory), the browser reloads the page. A marker left in localStorage tells
 // the next load to be more careful: level 1 draws one sprite at a time, level 2 also leaves the GPU for the CPU.
@@ -112,7 +116,8 @@ const readyText = () => {
 async function pickEP() {
   const forced = params.get("ep");
   if (forced === "wasm" || forced === "webgpu") { state.why = `forced by ?ep=${forced}`; return forced; }
-  if (state.safe >= 2) { state.why = "CPU after two crashes"; return "wasm"; }
+  if (state.safe >= 2) { state.why = "CPU after crashes or a WebGPU failure"; return "wasm"; }
+  if (IOS) { state.why = "iPhone / iPad: CPU by default (?ep=webgpu to try the GPU)"; return "wasm"; }
   if (!navigator.gpu) { state.why = "no WebGPU in this browser"; return "wasm"; }
   try {
     if (await navigator.gpu.requestAdapter()) { state.why = "WebGPU adapter found"; return "webgpu"; }
@@ -153,6 +158,40 @@ if (params.has("debug")) {  // record WebAssembly memories, to see how much the 
   window.wasmMB = () => [...mems].map((m) => Math.round(m.buffer.byteLength / 1e6));
 }
 
+async function loadBackend(ep) {
+  const m = await loadModel({ ort: state.ort, files: modelFiles(MODEL_BASE), ep, fetchBytes, fixedCache: true,
+                              onProgress: progress("Downloading the model (once)") });
+  status(ep === "webgpu" ? "Preparing the GPU…" : "Preparing…");
+  await warmUp(m);
+  return m;
+}
+
+function setBackend(ep) {
+  state.ep = ep;
+  $("ep").textContent = ep === "webgpu" ? "WebGPU" : "CPU";
+  $("ep").hidden = false;
+  if (!nTouched) $("n").value = defaultN(Number(radio("size")));
+  diagnostics();
+  status(readyText());
+  updateHints();
+}
+
+/** WebGPU broke in the middle of a run (e.g. "map async was not successful": the GPU device was lost). Load the
+ * CPU backend instead (the files are cached) and remember it for this device. */
+async function switchToCPU(reason) {
+  state.why = `WebGPU failed while drawing: ${reason}`.slice(0, 160);
+  state.safe = 2;
+  store.set(SAFE, 2);
+  const old = state.model;
+  state.model = null;
+  $("go").disabled = true;
+  try { await old?.session.release(); } catch { /* already broken */ }
+  status("Switching to the CPU…");
+  state.model = await loadBackend("wasm");
+  setBackend("wasm");
+  $("go").disabled = false;
+}
+
 async function boot() {
   try {
     state.safe = safeLevel();
@@ -162,29 +201,17 @@ async function boot() {
     for (const it of presets.items) state.presets.set(it.text, b64floats(it.vector));
     buildChips(presets.items.map((i) => i.text));
     let ep = await pickEP();
-    const files = modelFiles(MODEL_BASE);
-    const load = async (ep) => {
-      const m = await loadModel({ ort, files, ep, fetchBytes, fixedCache: true, onProgress: progress("Downloading the model (once)") });
-      status(ep === "webgpu" ? "Preparing the GPU…" : "Preparing…");
-      await warmUp(m);
-      return m;
-    };
     try {  // loading is not guarded: the CPU fallback needs more memory than WebGPU, not less
-      state.model = await load(ep);
+      state.model = await loadBackend(ep);
     } catch (e) {
       if (ep !== "webgpu") throw e;
       console.warn("WebGPU failed, falling back to the CPU:", e);
       state.why = `WebGPU failed: ${e.message || e}`.slice(0, 160);
       ep = "wasm";
-      state.model = await load(ep);
+      state.model = await loadBackend(ep);
     }
-    state.ep = ep;
-    $("ep").textContent = ep === "webgpu" ? "WebGPU" : "CPU";
-    $("ep").hidden = false;
-    diagnostics();
-    status(readyText());
+    setBackend(ep);
     $("go").disabled = false;
-    updateHints();
     pruneCache();
     if (params.has("debug")) window.pixelsprite = state;  // for timing from the console
   } catch (e) {
@@ -251,7 +278,7 @@ function updateHints() {
 document.querySelectorAll("input[name=mode], input[name=size]").forEach((r) => r.addEventListener("change", updateHints));
 // Until the user sets "How many", it follows the size: 8 at 16x16 and 4 at 24x24 / 32x32 (4 and 2 on phones).
 let nTouched = false;
-const defaultN = (size) => (size === 16 ? (MOBILE ? 4 : 8) : (MOBILE ? 2 : 4));
+const defaultN = (size) => (size === 16 ? (MOBILE ? (state.ep === "wasm" ? 2 : 4) : 8) : (MOBILE ? (state.ep === "wasm" ? 1 : 2) : 4));
 $("n").value = defaultN(Number(radio("size")));
 $("n").addEventListener("input", () => { nTouched = true; });
 document.querySelectorAll("input[name=size]").forEach((r) => r.addEventListener("change", () => {
@@ -402,6 +429,7 @@ async function run(st) {
   markBusy("run");
   const go = $("go"); go.textContent = "Stop"; go.classList.add("stop");
   const t0 = performance.now();
+  let frame = 0;  // pending progress repaint; cancelled on error so it cannot overwrite the error message
   try {
     const vector = await vectorFor(st.text);
     const model = state.model, w = st.size, chunk = chunkFor(st.size);
@@ -413,7 +441,7 @@ async function run(st) {
       if (!state.pad.some((v) => v)) throw new Error("Draw a silhouette first.");
       mask = state.pad.slice();
     }
-    let frame = 0, pending = null, done = 0, total = 0, noted = 0;
+    let pending = null, done = 0, total = 0, noted = 0;
     const live = (cards) => (ids, t, imgs, view) => {
       pending = { ids, t, imgs, view, cards };
       const now = performance.now();
@@ -464,8 +492,20 @@ async function run(st) {
       const a = document.createElement("a"); a.href = sheetUrl(all, w); a.download = `${slug(st.text)}_${st.size}_s${st.seed}_sheet.png`; a.click();
     };
   } catch (e) {
+    if (frame) { cancelAnimationFrame(frame); frame = 0; }
     if (e.name === "AbortError") { meta.textContent = "stopped"; grid.querySelectorAll(".card").forEach((c) => c.remove()); el.remove(); }
-    else { console.error(e); meta.className = "meta error"; meta.textContent = e.message || String(e); }
+    else if (state.ep === "webgpu" && state.model && /OrtRun|webgpu|map ?async|device|GPU/i.test(String(e.message || e))) {
+      console.error(e);
+      const why = String(e.message || e).replace(/^.*?(map async|device|lost|out of memory)/i, "$1").slice(0, 120);
+      meta.className = "meta error";
+      meta.textContent = `WebGPU failed on this device (${why}). Switching to the CPU…`;
+      try {
+        await switchToCPU(why);
+        meta.textContent = "WebGPU failed on this device, so the page switched to the CPU. Press Draw again.";
+      } catch (e2) {
+        meta.textContent = `WebGPU failed and the CPU could not load: ${e2.message || e2}`;
+      }
+    } else { console.error(e); meta.className = "meta error"; meta.textContent = e.message || String(e); }
   } finally {
     markIdle();
     state.running = null;
