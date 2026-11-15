@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pixelsprite</title>
+<style>
+/* Layout: controls column (sticky on wide screens) + results column; each run is a block, newest first. */
+:root {
+  --bg: #f3f4f6; --panel: #ffffff; --ink: #16181d; --ink-2: #4b505b; --muted: #7b818d; --rule: #dde0e6;
+  --accent: #2d5bd0; --accent-ink: #ffffff; --accent-soft: #e6ecfa; --err: #b42318;
+  --chk-a: #ffffff; --chk-b: #e7e9ed; --paint: #16181d; --grid: #dfe2e8;
+  --font: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101216; --panel: #181b21; --ink: #e7e9ee; --ink-2: #b2b7c1; --muted: #858b97; --rule: #2a2e36;
+    --accent: #7f9ef2; --accent-ink: #0c1220; --accent-soft: #1b2440; --err: #ff8a80;
+    --chk-a: #2a2d33; --chk-b: #22252b; --paint: #e7e9ee; --grid: #2f333b; color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--font); padding: 20px max(16px, env(safe-area-inset-left)) 40px; }
+.app { display: grid; grid-template-columns: 350px minmax(0, 1fr); gap: 24px; max-width: 1500px; margin: 0 auto; align-items: start; }
+@media (max-width: 860px) { .app { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+@media (min-width: 861px) { .controls { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto; } }
+h1 { font-size: 1.25rem; margin: 0; font-weight: 600; }
+.info { font: 12px/1.5 var(--mono); color: var(--muted); }
+label, .lbl { font-size: 13px; color: var(--ink-2); font-weight: 600; display: block; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+input[type=text], input[type=number] { width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; }
+input:focus-visible, button:focus-visible, .seg label:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: 12px var(--font); border: 1px solid var(--rule); background: var(--bg); color: var(--ink-2); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+.seg label { margin: 0; font-weight: 500; font-size: 13px; text-align: center; padding: 7px 4px; cursor: pointer; color: var(--ink-2); border-left: 1px solid var(--rule); }
+.seg label:first-child { border-left: 0; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--accent-soft); color: var(--accent); }
+.slider { display: grid; grid-template-columns: 1fr 3.2rem; gap: 10px; align-items: center; }
+.slider output { font: 13px var(--mono); text-align: right; color: var(--ink); }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.hint { font-size: 12px; color: var(--muted); }
+.checks { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--ink-2); }
+.checks label { font-weight: 400; display: flex; gap: 8px; align-items: center; }
+.btn { font: 600 15px var(--font); border: 0; border-radius: 6px; padding: 11px 14px; background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+.btn:disabled { opacity: 0.6; cursor: progress; }
+.btn-sm { font: 12px var(--font); border: 1px solid var(--rule); border-radius: 5px; padding: 4px 9px; background: var(--panel); color: var(--ink-2); cursor: pointer; text-decoration: none; white-space: nowrap; }
+.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+.maskbox { display: flex; gap: 12px; align-items: center; }
+.maskbox > div { min-width: 0; }
+input[type=file] { max-width: 100%; font-size: 12px; color: var(--ink-2); }
+.maskbox img { flex: none; width: 64px; height: 64px; image-rendering: pixelated; border: 1px solid var(--rule); border-radius: 4px; background: repeating-conic-gradient(var(--chk-a) 0 25%, var(--chk-b) 0 50%) 0 0 / 8px 8px; }
+.maskbox .empty { flex: none; width: 64px; height: 64px; border: 1px dashed var(--rule); border-radius: 4px; display: grid; place-items: center; color: var(--muted); font-size: 11px; text-align: center; }
+.drawbox { display: flex; flex-direction: column; gap: 8px; }
+#pad { width: 100%; max-width: 312px; aspect-ratio: 1; touch-action: none; cursor: crosshair; border: 1px solid var(--rule); border-radius: 4px; background: var(--bg); }
+.drawtools { display: flex; gap: 6px; flex-wrap: wrap; }
+.results { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.run { display: flex; flex-direction: column; gap: 12px; }
+.run-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+.run-title { font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.badge { font: 11px var(--mono); padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+.meta { font: 12px/1.6 var(--mono); color: var(--muted); }
+.error { color: var(--err); font-size: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 12px; }
+.card { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+.sprite { width: 128px; height: 128px; image-rendering: pixelated; border-radius: 4px; border: 1px solid var(--rule);
+  background: repeating-conic-gradient(var(--chk-a) 0 25%, var(--chk-b) 0 50%) 0 0 / 16px 16px; }
+.mask-img { width: 64px; height: 64px; image-rendering: pixelated; opacity: 0.9; }
+.card .acts { display: flex; gap: 4px; }
+.empty-state { color: var(--muted); padding: 40px 8px; text-align: center; }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--accent-ink); border-right-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right: 8px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <form class="panel controls" id="form" autocomplete="off">
+    <div>
+      <h1>pixelsprite</h1>
+      <div class="info" id="info">loading…</div>
+    </div>
+
+    <div class="field">
+      <span class="lbl">Size</span>
+      <div class="seg" role="radiogroup" aria-label="Size">
+        <label><input type="radio" name="size" value="16" checked>16×16</label>
+        <label><input type="radio" name="size" value="24">24×24</label>
+        <label><input type="radio" name="size" value="32">32×32</label>
+      </div>
+      <div class="hint">24×24 is a 24×24 window in the middle of the 32×32 canvas: the model never trained on this size.</div>
+    </div>
+
+    <div class="field">
+      <label for="text">Caption</label>
+      <input type="text" id="text" placeholder="empty = no text" value="frost sword">
+      <div class="chips" id="chips"></div>
+    </div>
+
+    <div class="field">
+      <span class="lbl">Silhouette</span>
+      <div class="seg" role="radiogroup" aria-label="Silhouette mode">
+        <label><input type="radio" name="mode" value="new" checked>new</label>
+        <label><input type="radio" name="mode" value="same">one</label>
+        <label><input type="radio" name="mode" value="file">file</label>
+        <label><input type="radio" name="mode" value="draw">draw</label>
+      </div>
+      <div class="hint" id="modeHint"></div>
+      <div class="maskbox" id="maskbox" hidden>
+        <div class="empty" id="maskEmpty">no silhouette</div>
+        <img id="maskPreview" alt="chosen silhouette" hidden>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <input type="file" id="maskFile" accept="image/png">
+          <span class="hint">PNG with transparency at the canvas size (or an integer upscale). Or press “silhouette →” under a sprite.</span>
+        </div>
+      </div>
+      <div class="drawbox" id="drawbox" hidden>
+        <canvas id="pad" width="312" height="312" aria-label="Grid for drawing a silhouette"></canvas>
+        <div class="drawtools">
+          <button type="button" class="btn-sm" id="clearPad">clear</button>
+          <button type="button" class="btn-sm" id="fillPad">fill all</button>
+          <button type="button" class="btn-sm" id="invertPad">invert</button>
+        </div>
+        <div class="hint">Left button draws, right button or Shift erases. The model colours the silhouette from the caption.</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="field"><label for="n">How many</label><input type="number" id="n" min="1" max="64" value="16"></div>
+      <div class="field">
+        <label for="seed">Seed</label>
+        <div style="display:flex;gap:6px"><input type="number" id="seed" value="0"><button type="button" class="btn-sm" id="rnd" title="random seed">rnd</button></div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="gs">Shape guidance</label>
+      <div class="slider"><input type="range" id="gs" min="0" max="4" step="0.25" value="1"><output for="gs" id="gsv"></output></div>
+      <label for="gc">Colour guidance</label>
+      <div class="slider"><input type="range" id="gc" min="0" max="4" step="0.25" value="2"><output for="gc" id="gcv"></output></div>
+      <div class="hint">Shape 1 keeps silhouettes and poses as in the data; higher is more typical but loses the pose. Colour 2 follows the caption more closely.</div>
+    </div>
+    <div class="field">
+      <label for="tc">Colour temperature</label>
+      <div class="slider"><input type="range" id="tc" min="0.3" max="1.5" step="0.05" value="1"><output for="tc" id="tcv"></output></div>
+      <label for="tp">Top-p</label>
+      <div class="slider"><input type="range" id="tp" min="0.5" max="1" step="0.01" value="1"><output for="tp" id="tpv"></output></div>
+      <div class="checks"><label><input type="checkbox" id="filter" checked> redraw sprites with stray 1–2 px pieces</label></div>
+    </div>
+
+    <div class="checks">
+      <label><input type="checkbox" id="autoseed"> new seed every run</label>
+      <label><input type="checkbox" id="showMasks"> show silhouettes</label>
+    </div>
+    <button class="btn" id="go" type="submit">Generate</button>
+    <div class="hint">Captions can be in English, Russian or Ukrainian.</div>
+  </form>
+
+  <section class="results" id="results" aria-live="polite">
+    <div class="panel empty-state" id="empty">Results appear here. New runs are added on top, so you can compare sizes and settings on one caption.</div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const EXAMPLES = ["frost sword", "golden crown", "blue mushroom", "upright sword", "ninja", "treasure chest",
+                  "a teal cookie jar", "ледяной меч", "вогняний череп", ""];
+const state = { maskPng: null, running: false, pad: null, padSize: 16 };
+
+for (const t of EXAMPLES) {
+  const b = document.createElement("button"); b.type = "button"; b.className = "chip"; b.textContent = t || "no text";
+  b.onclick = () => { $("text").value = t; $("text").focus(); };
+  $("chips").appendChild(b);
+}
+for (const [id, out] of [["gs", "gsv"], ["gc", "gcv"], ["tc", "tcv"], ["tp", "tpv"]]) {
+  const upd = () => { $(out).textContent = Number($(id).value).toFixed(2); };
+  $(id).addEventListener("input", upd); upd();
+}
+$("rnd").onclick = () => { $("seed").value = Math.floor(Math.random() * 1e6); };
+const radio = (name) => document.querySelector(`input[name=${name}]:checked`).value;
+const MODE_HINTS = {
+  new: "The model draws every sprite from scratch.",
+  same: "One sprite first, then n colourings of its silhouette.",
+  file: "Colour your own silhouette from a PNG.",
+  draw: "Draw a silhouette and the model colours it.",
+};
+
+// ---------------------------------------------------------------- drawing pad
+function newPad(size) { state.padSize = size; state.pad = Array.from({ length: size }, () => new Array(size).fill(false)); drawPad(); }
+function drawPad() {
+  const cv = $("pad"), ctx = cv.getContext("2d"), s = state.padSize, cell = cv.width / s;
+  const css = getComputedStyle(document.documentElement);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = css.getPropertyValue("--paint").trim();
+  for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) if (state.pad[y][x]) ctx.fillRect(x * cell, y * cell, cell, cell);
+  ctx.strokeStyle = css.getPropertyValue("--grid").trim(); ctx.lineWidth = 1;
+  for (let i = 0; i <= s; i++) {
+    ctx.beginPath(); ctx.moveTo(i * cell + 0.5, 0); ctx.lineTo(i * cell + 0.5, cv.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * cell + 0.5); ctx.lineTo(cv.width, i * cell + 0.5); ctx.stroke();
+  }
+}
+let painting = null, lastCell = null;
+function padCell(e) {
+  const cv = $("pad"), r = cv.getBoundingClientRect(), s = state.padSize;
+  const x = Math.floor((e.clientX - r.left) / r.width * s), y = Math.floor((e.clientY - r.top) / r.height * s);
+  return x >= 0 && y >= 0 && x < s && y < s ? [x, y] : null;
+}
+function paintLine(a, b) {  // every cell between two pointer events, so fast strokes leave no gaps
+  const n = Math.max(Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]), 1);
+  for (let i = 0; i <= n; i++) {
+    const x = Math.round(a[0] + (b[0] - a[0]) * i / n), y = Math.round(a[1] + (b[1] - a[1]) * i / n);
+    state.pad[y][x] = painting;
+  }
+}
+$("pad").addEventListener("contextmenu", (e) => e.preventDefault());
+$("pad").addEventListener("pointerdown", (e) => {
+  painting = !(e.button === 2 || e.shiftKey); $("pad").setPointerCapture(e.pointerId);
+  const c = padCell(e); if (c) { paintLine(c, c); lastCell = c; drawPad(); }
+});
+$("pad").addEventListener("pointermove", (e) => {
+  if (painting === null) return;
+  const c = padCell(e); if (!c) return;
+  paintLine(lastCell || c, c); lastCell = c; drawPad();
+});
+$("pad").addEventListener("pointerup", () => { painting = null; lastCell = null; });
+$("clearPad").onclick = () => newPad(state.padSize);
+$("fillPad").onclick = () => { state.pad = state.pad.map((r) => r.map(() => true)); drawPad(); };
+$("invertPad").onclick = () => { state.pad = state.pad.map((r) => r.map((v) => !v)); drawPad(); };
+function padFromImage(dataUrl) {
+  const im = new Image();
+  im.onload = () => {
+    const s = im.width, cv = document.createElement("canvas"); cv.width = s; cv.height = s;
+    const ctx = cv.getContext("2d"); ctx.drawImage(im, 0, 0); const d = ctx.getImageData(0, 0, s, s).data;
+    state.padSize = s; state.pad = Array.from({ length: s }, (_, y) => Array.from({ length: s }, (_, x) => d[(y * s + x) * 4 + 3] >= 128));
+    document.querySelector(`input[name=size][value="${s}"]`)?.click(); drawPad();
+  };
+  im.src = dataUrl;
+}
+
+function onChange() {
+  const md = radio("mode");
+  $("modeHint").textContent = MODE_HINTS[md];
+  $("maskbox").hidden = md !== "file";
+  $("drawbox").hidden = md !== "draw";
+  const size = Number(radio("size"));
+  if (md === "draw" && state.padSize !== size) newPad(size);
+}
+document.querySelectorAll("input[name=mode], input[name=size]").forEach((r) => r.addEventListener("change", onChange));
+newPad(16); onChange();
+
+function setMask(dataUrl) { state.maskPng = dataUrl; $("maskPreview").src = dataUrl; $("maskPreview").hidden = false; $("maskEmpty").hidden = true; }
+$("maskFile").addEventListener("change", (e) => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => setMask(r.result); r.readAsDataURL(f); });
+
+fetch("/api/info").then((r) => r.json()).then((i) => {
+  $("info").textContent = `${i.device} · ${(i.params / 1e6).toFixed(1)}M params · palette ${i.palette} colours`;
+}).catch(() => { $("info").textContent = "server not responding"; });
+
+function sheetDataUrl(sprites, cols = 8, gap = 8) {
+  return Promise.all(sprites.map((b64) => new Promise((res) => { const im = new Image(); im.onload = () => res(im); im.src = "data:image/png;base64," + b64; })))
+    .then((ims) => {
+      const s0 = ims[0].width, sc = Math.max(2, Math.round(128 / s0)), cell = s0 * sc, rows = Math.ceil(ims.length / cols);
+      const cv = document.createElement("canvas"); cv.width = cols * cell + (cols + 1) * gap; cv.height = rows * cell + (rows + 1) * gap;
+      const ctx = cv.getContext("2d"); ctx.imageSmoothingEnabled = false;
+      ims.forEach((im, k) => ctx.drawImage(im, gap + (k % cols) * (cell + gap), gap + Math.floor(k / cols) * (cell + gap), cell, cell));
+      return cv.toDataURL("image/png");
+    });
+}
+function slug(t) { return (t || "unconditional").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_|_$/g, "").slice(0, 40) || "unconditional"; }
+
+function renderRun(res) {
+  $("empty")?.remove();
+  const run = document.createElement("article"); run.className = "panel run";
+  const head = document.createElement("div"); head.className = "run-head";
+  const title = document.createElement("div"); title.className = "run-title";
+  const tt = document.createElement("span"); tt.textContent = res.text ? `“${res.text}”` : "no text";
+  const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = `${res.size}×${res.size}`;
+  title.append(tt, badge);
+  const sheetBtn = document.createElement("button"); sheetBtn.type = "button"; sheetBtn.className = "btn-sm"; sheetBtn.textContent = "download sheet";
+  sheetBtn.onclick = () => sheetDataUrl(res.sprites).then((u) => { const a = document.createElement("a"); a.href = u; a.download = `${slug(res.text)}_${res.size}_s${res.seed}_sheet.png`; a.click(); });
+  head.append(title, sheetBtn); run.appendChild(head);
+
+  const meta = document.createElement("div"); meta.className = "meta";
+  const modeName = { new: "new", same: "one silhouette", file: "your silhouette", draw: "drawn silhouette" }[res.mode];
+  let m = `${modeName} · n=${res.n} · seed=${res.seed} · shape g ${res.g_shape} · colour g ${res.g_colour} · T ${res.temperature} · top-p ${res.top_p} · ${res.seconds} s`;
+  const st = res.stats; if (st) m += res.filter ? ` · filter redrew ${st.rejected} of ${st.sampled}` : " · filter off";
+  meta.textContent = m; run.appendChild(meta);
+  const grid = document.createElement("div"); grid.className = "grid";
+  res.sprites.forEach((b64, k) => {
+    const card = document.createElement("div"); card.className = "card";
+    const img = document.createElement("img"); img.className = "sprite"; img.alt = `sprite ${k + 1}`; img.src = "data:image/png;base64," + b64; card.appendChild(img);
+    if ($("showMasks").checked) { const mi = document.createElement("img"); mi.className = "mask-img"; mi.alt = `silhouette ${k + 1}`; mi.src = "data:image/png;base64," + res.masks[k]; card.appendChild(mi); }
+    const acts = document.createElement("div"); acts.className = "acts";
+    const dl = document.createElement("a"); dl.className = "btn-sm"; dl.textContent = "PNG"; dl.href = img.src; dl.download = `${slug(res.text)}_${res.size}_s${res.seed}_${String(k).padStart(2, "0")}.png`;
+    const um = document.createElement("button"); um.type = "button"; um.className = "btn-sm"; um.textContent = "silhouette →"; um.title = "use this silhouette for colouring / drawing";
+    um.onclick = () => {
+      const url = "data:image/png;base64," + res.masks[k];
+      setMask(url); document.querySelector("input[name=mode][value=draw]").checked = true; padFromImage(url);
+      onChange(); $("text").focus();
+    };
+    acts.append(dl, um); card.appendChild(acts); grid.appendChild(card);
+  });
+  run.appendChild(grid); $("results").prepend(run);
+}
+function showError(msg) { $("empty")?.remove(); const d = document.createElement("div"); d.className = "panel error"; d.textContent = msg; $("results").prepend(d); }
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault(); if (state.running) return;
+  if ($("autoseed").checked) $("seed").value = Math.floor(Math.random() * 1e6);
+  const mode = radio("mode");
+  const body = { text: $("text").value, n: Number($("n").value), seed: Number($("seed").value), mode, size: Number(radio("size")),
+                 g_shape: Number($("gs").value), g_colour: Number($("gc").value), temperature: Number($("tc").value),
+                 top_p: Number($("tp").value), filter: $("filter").checked,
+                 mask_png: mode === "file" ? state.maskPng : null,
+                 mask_bits: mode === "draw" ? state.pad.map((r) => r.map((v) => (v ? "1" : "0")).join("")) : null };
+  state.running = true; const go = $("go"); go.disabled = true; go.innerHTML = '<span class="spinner" aria-hidden="true"></span>drawing…';
+  try {
+    const r = await fetch("/api/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const res = await r.json(); if (!r.ok) showError(res.error || `error ${r.status}`); else renderRun(res);
+  } catch (err) { showError("server not responding: " + err); }
+  finally { state.running = false; go.disabled = false; go.textContent = "Generate"; }
+});
+</script>
+</body>
+</html>

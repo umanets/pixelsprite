@@ -1,0 +1,10 @@
+pixelsprite
+Copyright 2026 Ihor Umanets
+
+The code in this repository is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The model weights it downloads are a separate work, published on Hugging Face under CC BY-NC 4.0
+(non-commercial). See the model card for the training data and its licences:
+- Angais/pixel-art-atlas-1.4m (CC0 1.0; generated with Krea 2 Turbo + a pixel-art LoRA; Krea terms are not waived)
+- azyg0s/pixelart-172k (MIT; AI-generated)
+The text encoder sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 is licensed under Apache-2.0.
