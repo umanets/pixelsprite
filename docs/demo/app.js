@@ -4,7 +4,7 @@ import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js";
 
 const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 const TOKENIZERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.2.0/dist/tokenizers.min.mjs";
-const MODEL_REVISION = "57988643e000dba67e208260f352c845c8f6628f";  // a commit, so cached files never go stale
+const MODEL_REVISION = "0d11db9276133e989deece73d3f916fcf13276bc";  // a commit, so cached files never go stale
 const CACHE_NAME = "pixelsprite-v1";
 
 const params = new URLSearchParams(location.search);
@@ -15,33 +15,6 @@ const ENCODER_BASE = base(params.get("encoder"), `https://huggingface.co/${ENCOD
 const $ = (id) => document.getElementById(id);
 const radio = (name) => document.querySelector(`input[name=${name}]:checked`).value;
 const state = { ort: null, model: null, ep: null, encoder: null, presets: new Map(), running: null, pad: null, padSize: 16 };
-
-// Phones (iOS Safari / Chrome, Android) give a tab far less memory than a desktop: draw fewer sprites at once there.
-const MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
-  (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));  // iPadOS reports itself as a Mac
-
-// If the tab dies mid-run (out of memory), the browser reloads the page. A marker left in localStorage tells the
-// next load to be more careful: level 1 draws one sprite at a time, level 2 also leaves the GPU for the CPU.
-const store = {
-  get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
-  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode */ } },
-  del: (k) => { try { localStorage.removeItem(k); } catch { /* private mode */ } },
-};
-const BUSY = "pixelsprite-busy", SAFE = "pixelsprite-safe";
-function safeLevel() {
-  if (params.get("safe") === "0") { store.del(SAFE); store.del(BUSY); return 0; }
-  let level = Number(store.get(SAFE)) || 0;
-  const busy = store.get(BUSY);
-  if (busy && Date.now() - busy.t < 30 * 60e3) {
-    level = Math.min(2, Math.max(level, busy.level || 0) + 1);
-    store.set(SAFE, level);
-    state.crashed = true;
-  }
-  store.del(BUSY);
-  return level;
-}
-const markBusy = (phase) => store.set(BUSY, { t: Date.now(), phase, level: state.safe });
-const markIdle = () => store.del(BUSY);
 
 // ------------------------------------------------------------------------------------------- downloads + cache
 async function fetchBytes(url, onProgress) {
@@ -55,17 +28,17 @@ async function fetchBytes(url, onProgress) {
   if (!r.ok) throw new Error(`download failed (${r.status}): ${url}`);
   const total = Number(r.headers.get("content-length")) || 0;
   let bytes;
-  if (onProgress && r.body && total) {  // straight into one buffer: no second copy of 77 MB
-    const reader = r.body.getReader();
-    bytes = new Uint8Array(total);
+  if (onProgress && r.body) {
+    const reader = r.body.getReader(), parts = [];
     let got = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (got + value.length > total) throw new Error(`download larger than announced: ${url}`);
-      bytes.set(value, got); got += value.length; onProgress(got, total);
+      parts.push(value); got += value.length; onProgress(got, total);
     }
-    if (got !== total) throw new Error(`download cut short: ${url}`);
+    bytes = new Uint8Array(got);
+    let o = 0;
+    for (const p of parts) { bytes.set(p, o); o += p.length; }
   } else bytes = new Uint8Array(await r.arrayBuffer());
   if (cache) try { await cache.put(url, new Response(bytes)); } catch { /* storage full or blocked: fine */ }
   return bytes;
@@ -90,20 +63,13 @@ const mb = (b) => (b / 1e6).toFixed(0);
 const progress = (what) => (got, total) =>
   status(total ? `${what}: ${mb(got)} of ${mb(total)} MB` : `${what}: ${mb(got)} MB`, { frac: total ? got / total : 0 });
 
-const readyText = () => {
-  let s = state.ep === "webgpu" ? "Ready. Drawing on your GPU."
-    : state.safe >= 2 ? "Ready. Drawing on the CPU."
-    : "Ready. No WebGPU in this browser, so drawing on the CPU: 16×16 is fine, 24×24 and 32×32 are slow.";
-  if (state.crashed) s += " The page closed during the last run, probably out of memory, so it now draws one sprite at a time"
-    + (state.safe >= 2 ? " on the CPU." : ".");
-  return s;
-};
+const readyText = () => (state.ep === "webgpu" ? "Ready. Drawing on your GPU."
+  : "Ready. No WebGPU in this browser, so drawing on the CPU: 16×16 is fine, 24×24 and 32×32 are slow.");
 
 // ------------------------------------------------------------------------------------------------ model loading
 async function pickEP() {
   const forced = params.get("ep");
   if (forced === "wasm" || forced === "webgpu") return forced;
-  if (state.safe >= 2) return "wasm";
   try { if (navigator.gpu && (await navigator.gpu.requestAdapter())) return "webgpu"; } catch { /* no WebGPU */ }
   return "wasm";
 }
@@ -120,19 +86,8 @@ async function warmUp(model) {  // one prefix step + one cached step: compiles s
   if (!Number.isFinite(b.logits[0])) throw new Error("the backend returned NaN");
 }
 
-if (params.has("debug")) {  // record WebAssembly memories, to see how much the heap grows (console: wasmMB())
-  const mems = new Set(), Orig = WebAssembly.Memory;
-  WebAssembly.Memory = new Proxy(Orig, { construct(t, a) { const m = new t(...a); mems.add(m); return m; } });
-  const grab = (r) => { for (const v of Object.values((r.instance || r).exports || {})) if (v instanceof Orig) mems.add(v); return r; };
-  const inst = WebAssembly.instantiate, stream = WebAssembly.instantiateStreaming;
-  WebAssembly.instantiate = (...a) => inst.apply(WebAssembly, a).then(grab);
-  if (stream) WebAssembly.instantiateStreaming = (...a) => stream.apply(WebAssembly, a).then(grab);
-  window.wasmMB = () => [...mems].map((m) => Math.round(m.buffer.byteLength / 1e6));
-}
-
 async function boot() {
   try {
-    state.safe = safeLevel();
     const [ort, presets] = await Promise.all([import(ORT_URL), fetch("demo/presets.json").then((r) => r.json())]);
     state.ort = ort;
     ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
@@ -146,7 +101,6 @@ async function boot() {
       await warmUp(m);
       return m;
     };
-    markBusy("load");
     try {
       state.model = await load(ep);
     } catch (e) {
@@ -154,8 +108,6 @@ async function boot() {
       console.warn("WebGPU failed, falling back to the CPU:", e);
       ep = "wasm";
       state.model = await load(ep);
-    } finally {
-      markIdle();
     }
     state.ep = ep;
     $("ep").textContent = ep === "webgpu" ? "WebGPU" : "CPU";
@@ -227,13 +179,10 @@ function updateHints() {
   if (md === "draw" && state.padSize !== size) newPad(size);
 }
 document.querySelectorAll("input[name=mode], input[name=size]").forEach((r) => r.addEventListener("change", updateHints));
-// Until the user sets "How many", it follows the size: 8 at 16x16 and 4 at 24x24 / 32x32 (4 and 2 on phones).
-let nTouched = false;
-const defaultN = (size) => (size === 16 ? (MOBILE ? 4 : 8) : (MOBILE ? 2 : 4));
-$("n").value = defaultN(Number(radio("size")));
+let nTouched = false;  // until the user sets "How many", it follows the size: 8 at 16x16, 4 at 24x24 / 32x32
 $("n").addEventListener("input", () => { nTouched = true; });
 document.querySelectorAll("input[name=size]").forEach((r) => r.addEventListener("change", () => {
-  if (!nTouched) $("n").value = defaultN(Number(radio("size")));
+  if (!nTouched) $("n").value = Number(radio("size")) === 16 ? 8 : 4;
 }));
 
 // ------------------------------------------------------------------------------------------------- drawing pad
@@ -352,11 +301,8 @@ function readSettings() {
 
 // Sprites drawn in parallel. A step costs about the same for 1 or 16 rows on WebGPU, but the key/value cache grows
 // with batch x length: 8 guided 16x16 sprites need ~220 MB of GPU memory at the end, 4 guided 32x32 ones ~420 MB.
-// On the CPU every step also copies the cache in and out of WebAssembly. Phones get 2 / 1, after a crash 1.
 function chunkFor(size) {
   const big = size !== 16;
-  if (state.safe >= 1) return 1;
-  if (MOBILE) return big ? 1 : 2;
   return state.ep === "webgpu" ? (big ? 4 : 8) : (big ? 2 : 8);
 }
 
@@ -377,7 +323,6 @@ async function run(st) {
 
   const ctrl = new AbortController();
   state.running = ctrl;
-  markBusy("run");
   const go = $("go"); go.textContent = "Stop"; go.classList.add("stop");
   const t0 = performance.now();
   try {
@@ -440,7 +385,6 @@ async function run(st) {
     if (e.name === "AbortError") { meta.textContent = "stopped"; grid.querySelectorAll(".card").forEach((c) => c.remove()); el.remove(); }
     else { console.error(e); meta.className = "meta error"; meta.textContent = e.message || String(e); }
   } finally {
-    markIdle();
     state.running = null;
     go.textContent = "Draw"; go.classList.remove("stop");
     if (!state.model) go.disabled = true;
