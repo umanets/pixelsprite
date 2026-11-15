@@ -1,7 +1,7 @@
 // The demo page: loads onnxruntime-web and the model, turns captions into vectors, paints sprites as they are drawn.
 // Preview build at /next/: own files, own model cache and own localStorage keys, so it never touches the main demo.
-import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=5";  // ?v=N: bump with every release so browsers never mix cached files of two versions
-import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=5";
+import { HF_REPO, modelFiles, loadModel } from "./engine.js?v=6";  // ?v=N: bump with every release so browsers never mix cached files of two versions
+import { ENCODER, encoderFiles, loadTextEncoder } from "./text.js?v=6";
 
 const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 const TOKENIZERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.2.0/dist/tokenizers.min.mjs";
@@ -144,19 +144,24 @@ function diagnostics() {  // one line for screenshots: what this device got and 
                  `batch ${chunkFor(16)} / ${chunkFor(32)}`, `safe ${state.safe}`];
   if (/iPhone|iPad|iPod/.test(ua) && ios) parts.push(`iOS ${ios[1]}.${ios[2]}`);
   if (saf) parts.push(`Safari ${saf[1]}`);
+  parts.push(`heap ${heapMB()} MB`);
   if (state.crashedAt) parts.push(`last crash: ${state.crashedAt}`);
   $("diag").textContent = parts.join(" · ");
 }
 
-if (params.has("debug")) {  // record WebAssembly memories, to see how much the heap grows (console: wasmMB())
-  const mems = new Set(), Orig = WebAssembly.Memory;
-  WebAssembly.Memory = new Proxy(Orig, { construct(t, a) { const m = new t(...a); mems.add(m); return m; } });
-  const grab = (r) => { for (const v of Object.values((r.instance || r).exports || {})) if (v instanceof Orig) mems.add(v); return r; };
+// Record WebAssembly memories, to show how big onnxruntime's heap is in the diagnostics line and in the crash
+// marker (phones give no other memory reading). Installed before onnxruntime is imported.
+const wasmMems = new Set();
+{
+  const Orig = WebAssembly.Memory;
+  WebAssembly.Memory = new Proxy(Orig, { construct(t, a) { const m = new t(...a); wasmMems.add(m); return m; } });
+  const grab = (r) => { for (const v of Object.values((r.instance || r).exports || {})) if (v instanceof Orig) wasmMems.add(v); return r; };
   const inst = WebAssembly.instantiate, stream = WebAssembly.instantiateStreaming;
   WebAssembly.instantiate = (...a) => inst.apply(WebAssembly, a).then(grab);
   if (stream) WebAssembly.instantiateStreaming = (...a) => stream.apply(WebAssembly, a).then(grab);
-  window.wasmMB = () => [...mems].map((m) => Math.round(m.buffer.byteLength / 1e6));
 }
+const heapMB = () => Math.max(0, ...[...wasmMems].map((m) => Math.round(m.buffer.byteLength / 1e6)));
+window.wasmMB = () => [...wasmMems].map((m) => Math.round(m.buffer.byteLength / 1e6));
 
 async function loadBackend(ep) {
   const m = await loadModel({ ort: state.ort, files: modelFiles(MODEL_BASE), ep, fetchBytes, fixedCache: true,
@@ -447,7 +452,7 @@ async function run(st) {
       const now = performance.now();
       if (now - noted > 1000) {
         noted = now;
-        markBusy("run", `${st.size}×${st.size}, sprite ${done + 1} of ${total}, pixel ${t + 1} of ${view.S * view.S}, ${((now - t0) / 1000).toFixed(0)} s`);
+        markBusy("run", `${st.size}×${st.size}, sprite ${done + 1} of ${total}, pixel ${t + 1} of ${view.S * view.S}, ${((now - t0) / 1000).toFixed(0)} s, heap ${heapMB()} MB`);
       }
       if (!frame) frame = requestAnimationFrame(() => {
         frame = 0;

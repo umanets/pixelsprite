@@ -21,6 +21,15 @@ export const DATA_NAME = "decoder.data";
 
 const json = (bytes) => JSON.parse(new TextDecoder().decode(bytes));
 
+// On the CPU, onnxruntime-web computes inside session.run on this thread and resolves at once, so a loop of awaits
+// never gives the browser a chance to paint (the page looks frozen; phones may give up on it). A MessageChannel
+// task (no 4 ms clamp like setTimeout) lets it render between steps.
+const yieldToBrowser = () => new Promise((resolve) => {
+  const ch = new MessageChannel();
+  ch.port1.onmessage = () => { ch.port1.close(); resolve(); };
+  ch.port2.postMessage(0);
+});
+
 let HALF = null;
 /** Little-endian float16 bytes -> float32 bytes (the weights are shipped as float16 to halve the download). */
 export function halfToFloat(bytes) {
@@ -286,7 +295,7 @@ export class SpriteModel {
       this.writePrefix(x0, j * T0 * d, j >= b ? condU : condC, S, mask);
       this.writePixel(x0, (j * T0 + T0 - 1) * d, this.BOS, 0, 0, edge[0]);
     }
-    let logits, cache, spare = null, pos = 0;
+    let logits, cache, spare = null, pos = 0, lastYield = performance.now();
     const advance = async (xt) => {  // one more token -> logits of the next pixel
       const prev = cache;
       let r;
@@ -332,6 +341,7 @@ export class SpriteModel {
         const r = ((t + 1) / S) | 0, c = (t + 1) % S;
         for (let j = 0; j < B; j++) this.writePixel(x, j * d, tok[j % b], r, c, edge[t + 1]);
         await advance(x);
+        if (performance.now() - lastYield > 40) { await yieldToBrowser(); lastYield = performance.now(); }
       }
     } finally {
       SpriteModel.release(cache);
