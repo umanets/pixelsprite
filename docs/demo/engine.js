@@ -8,20 +8,43 @@ export const HF_REPO = "ihor-umanets/pixelsprite-canvas-v2";
 
 export function modelFiles(base) {
   return {
-    decoder: `${base}/onnx/decoder.onnx`,
+    decoder: `${base}/onnx/decoder.onnx`,   // float32 graph, large weights as external data "decoder.data"
+    weights: `${base}/onnx/decoder.f16`,    // those weights as float16, in the same order
     embJson: `${base}/onnx/embeddings.json`,
     embBin: `${base}/onnx/embeddings.bin`,
     palette: `${base}/palette.json`,
   };
 }
 
+export const DATA_NAME = "decoder.data";
+
 const json = (bytes) => JSON.parse(new TextDecoder().decode(bytes));
 
-export async function loadModel({ ort, files, ep = "wasm", fetchBytes, onProgress }) {
+let HALF = null;
+/** Little-endian float16 bytes -> float32 bytes (the weights are shipped as float16 to halve the download). */
+export function halfToFloat(bytes) {
+  if (!HALF) {
+    HALF = new Float32Array(65536);
+    for (let h = 0; h < 65536; h++) {
+      const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 31, f = h & 1023;
+      HALF[h] = e === 0 ? s * f * 2 ** -24 : e === 31 ? (f ? NaN : s * Infinity) : s * (1 + f / 1024) * 2 ** (e - 15);
+    }
+  }
+  if (bytes.byteOffset % 2) bytes = bytes.slice();
+  const h = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1), out = new Float32Array(h.length);
+  for (let i = 0; i < h.length; i++) out[i] = HALF[h[i]];
+  return new Uint8Array(out.buffer);
+}
+
+/** Loads the decoder. The weights go in as external data: onnxruntime-web then uploads them straight to the GPU
+ * (WebGPU) instead of first copying the whole model into the WebAssembly heap, which never shrinks again; that
+ * copy alone took ~560 MB and crashed phones. files.weights may be omitted for a self-contained graph (tests). */
+export async function loadModel({ ort, files, ep = "wasm", fetchBytes, onProgress, sessionOptions = {} }) {
   const [info, pal, emb] = await Promise.all([
     fetchBytes(files.embJson).then(json), fetchBytes(files.palette).then(json), fetchBytes(files.embBin)]);
-  const decoder = await fetchBytes(files.decoder, onProgress);
-  const opts = { executionProviders: [ep], graphOptimizationLevel: "all" };
+  const decoder = await fetchBytes(files.decoder, files.weights ? null : onProgress);
+  const opts = { executionProviders: [ep], graphOptimizationLevel: "all", ...sessionOptions };
+  if (files.weights) opts.externalData = [{ path: DATA_NAME, data: halfToFloat(await fetchBytes(files.weights, onProgress)) }];
   if (ep === "webgpu") {  // keep the cache on the GPU between steps; only the logits come back
     opts.preferredOutputLocation = {};
     for (let i = 0; i < info.n_layers; i++) {
