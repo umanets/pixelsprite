@@ -111,6 +111,31 @@ export function guided(lc, offC, lu, offU, K, gShape, gColour, temperature, topP
     s = emptyLogOdds(lc, offC, V, E);
     for (let j = 0; j < K; j++) col[j] = lc[offC + j];
   }
+  finishColour(col, K, temperature, topP, order);
+  return 1 / (1 + Math.exp(-s));
+}
+
+/** Mixing k captions (AND / product of experts): rows base .. base+k-1 hold the captions, row base+k the "no text"
+ * condition. w[g] is caption g's weight at this pixel. Shape log-odds and colour log-probabilities are
+ * s = s_u + sum_g w_g (s_g - s_u); then temperature and top-p as in guided(). */
+export function guidedMix(L, base, k, K, w, temperature, topP, col, order) {
+  const V = K + 1, E = K, offU = (base + k) * V;
+  const su = emptyLogOdds(L, offU, V, E), lsU = logSumExp(L, offU, K);
+  let s = su;
+  for (let j = 0; j < K; j++) col[j] = L[offU + j] - lsU;
+  for (let g = 0; g < k; g++) {
+    const off = (base + g) * V, wg = w[g];
+    if (!wg) continue;
+    s += wg * (emptyLogOdds(L, off, V, E) - su);
+    const ls = logSumExp(L, off, K);
+    for (let j = 0; j < K; j++) col[j] += wg * ((L[off + j] - ls) - (L[offU + j] - lsU));
+  }
+  finishColour(col, K, temperature, topP, order);
+  return 1 / (1 + Math.exp(-s));
+}
+
+/** Colour log-scores -> probabilities: temperature, softmax, then top-p. */
+function finishColour(col, K, temperature, topP, order) {
   const inv = 1 / Math.max(temperature, 1e-6);
   let m = -Infinity;
   for (let j = 0; j < K; j++) { col[j] *= inv; if (col[j] > m) m = col[j]; }
@@ -127,7 +152,6 @@ export function guided(lc, offC, lu, offU, K, gShape, gColour, temperature, topP
     }
     for (let j = 0; j < K; j++) col[j] /= kept;
   }
-  return 1 / (1 + Math.exp(-s));
 }
 
 function draw(col, K, u) {
@@ -136,6 +160,49 @@ function draw(col, K, u) {
   for (let j = K - 1; j >= 0; j--) if (col[j] > 0) return j;  // rounding at the very end
   return 0;
 }
+
+// ------------------------------------------------------------------------------------------ inference strategies
+// The runner (SpriteModel.drawChunk) only batches network rows, runs the model one token at a time and feeds each
+// sprite's pixel back into its rows. HOW a sprite turns the logits of its rows into its next pixel is a strategy:
+//
+//   { name,
+//     rows: [condition vectors from model.condition(...)],  // one network row each, contiguous in the batch
+//     pixel(L, base, t, c) -> p(EMPTY) }  // L: logits of the chunk (row r starts at r * (K + 1)); base: this
+//                                         // sprite's first row; t: pixel index; c: {K, temperature, topP, col,
+//                                         // order}; fills c.col with the colour probabilities
+//
+// Sprites with different strategies can share a chunk. To add a new way of sampling, add a factory here (or pass
+// your own object to generate({strategyFor})); the runner does not change. Cost: one network row per entry of rows.
+export const Strategy = {
+  /** One caption (or none), no guidance: the model's own distribution. */
+  plain(model, vector) {
+    return {
+      name: "plain", rows: [model.condition(vector)],
+      pixel: (L, base, t, c) => guided(L, base * (c.K + 1), L, -1, c.K, 1, 1, c.temperature, c.topP, c.col, c.order),
+    };
+  },
+  /** Split classifier-free guidance: the shape and the colours pulled towards the caption with their own strengths
+   * (needs a "no text" row as well). Without a caption, or with both strengths 1, it is plain. */
+  split(model, vector, gShape = 1, gColour = 2) {
+    if (!vector || (gShape === 1 && gColour === 1)) return Strategy.plain(model, vector);
+    const V = model.K + 1;
+    return {
+      name: "split", rows: [model.condition(vector), model.condition(null)],
+      pixel: (L, base, t, c) => guided(L, base * V, L, (base + 1) * V, c.K, gShape, gColour, c.temperature, c.topP, c.col, c.order),
+    };
+  },
+  /** Several captions at once (AND / product of experts) with weights per pixel: maps[g][t] for caption g. */
+  mix(model, vectors, maps) {
+    const k = vectors.length, w = new Float64Array(k);
+    return {
+      name: "mix", rows: [...vectors.map((v) => model.condition(v)), model.condition(null)],
+      pixel: (L, base, t, c) => {
+        for (let g = 0; g < k; g++) w[g] = maps[g][t];
+        return guidedMix(L, base, k, c.K, w, c.temperature, c.topP, c.col, c.order);
+      },
+    };
+  },
+};
 
 // ------------------------------------------------------------------------------------------------ silhouettes
 /** Edge flag per pixel: 0 inside, 1 on the boundary (4-neighbourhood, canvas edge = outside), 2 outside,
@@ -281,14 +348,22 @@ export class SpriteModel {
     return { logits: out.logits.data, cache: next };
   }
 
-  /** Draws b sprites on an S x S canvas in parallel. Returns b Int16Arrays (palette index, -1 = transparent). */
-  async drawChunk(p, b, rng, onPixel) {
-    const { condC, condU, S, mask, win, gShape, gColour, temperature, topP } = p;
-    const rep = condU ? 2 : 1, B = b * rep, n = S * S, d = this.d, K = this.K, E = this.E, V = K + 1;
+  /** The runner: draws one sprite per strategy on an S x S canvas in parallel. Every strategy owns rows.length
+   * contiguous rows of the batch; the runner knows nothing about guidance. Returns Int16Arrays (palette index,
+   * -1 = transparent), one per strategy. */
+  async drawChunk(strategies, p, rng, onPixel) {
+    const { S, mask, win, temperature, topP } = p;
+    const b = strategies.length, n = S * S, d = this.d, K = this.K, E = this.E;
+    const bases = [];
+    let B = 0;
+    for (const st of strategies) { bases.push(B); B += st.rows.length; }
+    const owner = new Int32Array(B);  // row -> sprite
+    strategies.forEach((st, i) => { for (let r = 0; r < st.rows.length; r++) owner[bases[i] + r] = i; });
     const edge = edgeFlags(mask, S);
     const T0 = 2 + S + 1, x0 = new Float32Array(B * T0 * d);
     for (let j = 0; j < B; j++) {
-      this.writePrefix(x0, j * T0 * d, j >= b ? condU : condC, S, mask);
+      const i = owner[j];
+      this.writePrefix(x0, j * T0 * d, strategies[i].rows[j - bases[i]], S, mask);
       this.writePixel(x0, (j * T0 + T0 - 1) * d, this.BOS, 0, 0, edge[0]);
     }
     let logits, cache, pos = 0, lastYield = performance.now();
@@ -309,7 +384,7 @@ export class SpriteModel {
     } else ({ logits, cache } = await this.step(x0, B, T0, this.emptyCache(B)));
     const out = Array.from({ length: b }, () => new Int16Array(n).fill(-1));
     const x = new Float32Array(B * d), tok = new Int32Array(b);
-    const col = new Float64Array(K), order = topP < 1 ? new Int32Array(K) : null;
+    const ctx = { K, temperature, topP, col: new Float64Array(K), order: topP < 1 ? new Int32Array(K) : null };
     try {
       for (let t = 0; t < n; t++) {
         if (p.signal && p.signal.aborted) { const e = new Error("stopped"); e.name = "AbortError"; throw e; }
@@ -318,16 +393,16 @@ export class SpriteModel {
           let pe = 0;
           if (forceEmpty) pe = 1;
           else {
-            pe = guided(logits, i * V, logits, condU ? (b + i) * V : -1, K, gShape, gColour, temperature, topP, col, order);
+            pe = strategies[i].pixel(logits, bases[i], t, ctx);
             if (forceFill) pe = 0;
           }
-          tok[i] = rng() < pe ? E : draw(col, K, rng());
+          tok[i] = rng() < pe ? E : draw(ctx.col, K, rng());
           out[i][t] = tok[i] === E ? -1 : tok[i];
         }
         if (onPixel) onPixel(t, out);
         if (t + 1 === n) break;
         const r = ((t + 1) / S) | 0, c = (t + 1) % S;
-        for (let j = 0; j < B; j++) this.writePixel(x, j * d, tok[j % b], r, c, edge[t + 1]);
+        for (let j = 0; j < B; j++) this.writePixel(x, j * d, tok[owner[j]], r, c, edge[t + 1]);
         await advance(x);
         if (performance.now() - lastYield > 40) { await yieldToBrowser(); lastYield = performance.now(); }
       }
@@ -340,10 +415,13 @@ export class SpriteModel {
   /** n sprites of size 16, 24 or 32 (24 = a 24x24 window in the middle of the 32x32 canvas).
    * vector: caption vector or null; mask: Uint8Array(size*size) silhouette or null (then the filter is off).
    * onPixel(ids, t, images, view) is called after every pixel; view = {S, o, w}: canvas size, window offset and
-   * width. signal: an AbortSignal to stop between pixels. Returns {images: Int16Array(size*size)[], stats}. */
+   * width. signal: an AbortSignal to stop between pixels. Returns {images: Int16Array(size*size)[], stats}.
+   * How each sprite is sampled: strategyFor(id, view) -> a Strategy (see above); without it, split guidance on
+   * `vector` with gShape / gColour for every sprite. Chunks hold as many sprites as fit in `rows` network rows
+   * (default: `chunk` sprites of the first sprite's strategy, i.e. 2 * chunk rows for split guidance). */
   async generate({ vector = null, n = 8, size = 16, seed = 0, gShape = 1, gColour = 2, temperature = 1, topP = 1,
-                   mask = null, filter = true, chunk = 8, maxRounds = 50, onPixel = null, onSprite = null,
-                   signal = null }) {
+                   mask = null, filter = true, chunk = 8, rows = 0, maxRounds = 50, onPixel = null, onSprite = null,
+                   signal = null, strategyFor = null }) {
     if (![16, 24, 32].includes(size)) throw new Error("size must be 16, 24 or 32");
     const S = size === 24 ? 32 : size, w = size, o = (S - w) >> 1;
     let m = null;
@@ -354,18 +432,26 @@ export class SpriteModel {
     const win = new Uint8Array(S * S);
     for (let y = o; y < o + w; y++) for (let x = o; x < o + w; x++) win[y * S + x] = 1;
     const useFilter = filter && !mask;
-    const condC = this.condition(vector);
-    const condU = vector && (gShape !== 1 || gColour !== 1) ? this.condition(null) : null;
-    const p = { condC, condU, S, mask: m, win, gShape, gColour, temperature, topP, signal };
-    const rng = makeRng(seed), view = { S, o, w };
+    const view = { S, o, w };
+    const shared = strategyFor ? null : Strategy.split(this, vector, gShape, gColour);
+    const strategyOf = (id) => (strategyFor ? strategyFor(id, view) : shared);
+    const p = { S, mask: m, win, temperature, topP, signal };
+    const rng = makeRng(seed);
     const images = new Array(n), stats = { sampled: 0, rejected: 0, rounds: 0, reasons: {} };
     let pending = Array.from({ length: n }, (_, i) => i);
     while (pending.length && stats.rounds < maxRounds) {
       stats.rounds++;
       const again = [];
-      for (let s = 0; s < pending.length; s += chunk) {
-        const ids = pending.slice(s, s + chunk);
-        const got = await this.drawChunk(p, ids.length, rng, onPixel ? (t, imgs) => onPixel(ids, t, imgs, view) : null);
+      for (let s = 0; s < pending.length;) {
+        const ids = [], sts = [];  // pack sprites while their rows fit the budget (at least one sprite per chunk)
+        let budget = 0, used = 0;
+        while (s < pending.length) {
+          const st = strategyOf(pending[s]);
+          if (!budget) budget = rows || chunk * st.rows.length;
+          if (ids.length && used + st.rows.length > budget) break;
+          ids.push(pending[s]); sts.push(st); used += st.rows.length; s++;
+        }
+        const got = await this.drawChunk(sts, p, rng, onPixel ? (t, imgs) => onPixel(ids, t, imgs, view) : null);
         ids.forEach((id, k) => {
           stats.sampled++;
           const why = useFilter ? rejected(got[k], S) : null;
